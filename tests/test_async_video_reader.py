@@ -178,6 +178,60 @@ def test_only_the_newest_of_many_requests_is_served(slow_reader_factory, referen
 
 
 @requires_fork
+def test_requests_for_the_frame_in_flight_share_its_decode(
+    slow_reader_factory, reference
+):
+    """Several consumers reading the same frame must all be served.
+
+    One video displayed in several subplots asks for the same frame once per view.
+    Superseding those against each other would leave every view but the last
+    without a frame.
+    """
+    packed, height = reference
+    reader = slow_reader_factory()
+
+    # three consumers, all asking for frame 42
+    futures = [reader[42], reader[42], reader[42]]
+    assert not any(f.done() for f in futures), "decode should still be in flight"
+
+    for future in futures:
+        y, _u, _v = future.result(timeout=RESULT_TIMEOUT)
+        np.testing.assert_array_equal(y[0], packed[42][:height])
+
+
+@requires_fork
+def test_shared_decode_gives_each_consumer_its_own_frame(
+    slow_reader_factory, reference
+):
+    """One consumer modifying its frame must not change what another was given."""
+    packed, height = reference
+    reader = slow_reader_factory()
+
+    first, second = reader[42], reader[42]
+    y_first = first.result(timeout=RESULT_TIMEOUT)[0]
+    y_second = second.result(timeout=RESULT_TIMEOUT)[0]
+
+    assert y_first is not y_second
+    y_first[:] = 0
+
+    np.testing.assert_array_equal(y_second[0], packed[42][:height])
+
+
+@requires_fork
+def test_a_new_frame_supersedes_every_shared_request(slow_reader_factory, reference):
+    """Sharing applies only to the frame in flight, a new one supersedes them all."""
+    packed, height = reference
+    reader = slow_reader_factory()
+
+    shared = [reader[0], reader[0]]
+    fresh = reader[42]
+
+    y, _u, _v = fresh.result(timeout=RESULT_TIMEOUT)
+    np.testing.assert_array_equal(y[0], packed[42][:height])
+    assert all(f.cancelled() for f in shared)
+
+
+@requires_fork
 def test_superseded_request_does_not_corrupt_the_result(slow_reader_factory, reference):
     """The winning frame must be intact, not a mix of two decodes.
 

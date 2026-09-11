@@ -173,6 +173,11 @@ class AsyncVideoReader:
         # bit can't distinguish *which* request was cancelled).
         self._latest_rid = mp_ctx.Value("q", 0)
         self._pending_future: FutureArray | None = None
+        # what the request in flight asked for, so that a request for the same frame can share
+        # its decode instead of superseding it
+        self._pending_selector: tuple | None = None
+        # the futures sharing the decode of the request in flight
+        self._shared_futures: list[FutureArray] = []
         self._listener_lock = threading.Lock()
 
         # guards the shared-memory teardown so a second shutdown() cannot
@@ -300,15 +305,16 @@ class AsyncVideoReader:
                     continue
 
                 if status != ReaderError.ok:
-                    # Fail the future rather than leave the caller blocked: the
+                    # Fail the futures rather than leave the consumers blocked: the
                     # worker survives the error, so nothing else will ever
                     # resolve this request. The traceback is in the worker log.
-                    self._pending_future.set_exception(
-                        RuntimeError(
-                            f"reader process failed to decode request {rid} "
-                            f"({ReaderError(status).name})"
-                        )
+                    error = RuntimeError(
+                        f"reader process failed to decode request {rid} "
+                        f"({ReaderError(status).name})"
                     )
+                    for future in (self._pending_future, *self._shared_futures):
+                        future.set_exception(error)
+                    self._shared_futures.clear()
                     continue
 
                 # TODO: if shared mem changes due to different number of frames
@@ -321,24 +327,28 @@ class AsyncVideoReader:
                 #         frame_shape, dtype=np.dtype(dtype), buffer=self._shared_mems.buf
                 #     )
 
-                future = self._pending_future
+                futures = (self._pending_future, *self._shared_futures)
+                self._shared_futures.clear()
 
                 # set_result must happen while holding _listener_lock, otherwise
-                # __getitem__ can cancel ``future`` between this point and the
+                # __getitem__ can cancel a future between this point and the
                 # set_result call below, raising InvalidStateError and killing
                 # the listener thread (the reader then permanently hangs).
                 with self._buffer_lock:
-                    if self.colorspace == Colorspace.rgb24 or self._yuv_packed:
-                        future.set_result(self._buffer.copy())
+                    # every consumer gets its own copy, none of them can modify
+                    # the frame another one was given
+                    for future in futures:
+                        if self.colorspace == Colorspace.rgb24 or self._yuv_packed:
+                            future.set_result(self._buffer.copy())
 
-                    elif self.colorspace == Colorspace.yuv420p:
-                        future.set_result(
-                            (
-                                self._buffer[0].copy(),
-                                self._buffer[1].copy(),
-                                self._buffer[2].copy(),
+                        elif self.colorspace == Colorspace.yuv420p:
+                            future.set_result(
+                                (
+                                    self._buffer[0].copy(),
+                                    self._buffer[1].copy(),
+                                    self._buffer[2].copy(),
+                                )
                             )
-                        )
 
     @staticmethod
     def _frame_index(index):
@@ -412,10 +422,30 @@ class AsyncVideoReader:
         return self._submit(float(ts), by_time=True)
 
     def _submit(self, selector, by_time: bool) -> FutureArray:
-        """Queue one request, superseding whatever is still in flight."""
+        """
+        Queue one request, superseding whatever is still in flight.
+
+        A request for the frame already in flight shares that decode instead of
+        superseding it. Without this, several consumers reading the same frame from one
+        reader would cancel each other and only the last one would be served, e.g. one
+        video displayed in several subplots.
+        """
         with self._listener_lock:
+            if (
+                self._pending_future is not None
+                and not self._pending_future.done()
+                and self._pending_selector == (selector, by_time)
+            ):
+                shared = Future()
+                self._shared_futures.append(shared)
+                return shared
+
             if self._pending_future is not None and not self._pending_future.done():
                 self._pending_future.cancel()
+            for shared in self._shared_futures:
+                shared.cancel()
+            self._shared_futures.clear()
+            self._pending_selector = (selector, by_time)
 
             self._pending_rid += 1
             # publish to the worker so it knows the newest rid in flight
