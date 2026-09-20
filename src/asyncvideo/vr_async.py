@@ -61,7 +61,7 @@ class AsyncVideoReader:
     yuv_packed :
         For a ``yuv420p`` video, transfer the frame as a single packed
         ``(1, H * 3 // 2, W)`` array rather than as a ``(Y, U, V)`` tuple of
-        planes. Ignored for ``rgb24`` video.
+        planes. Ignored for every other colorspace, there is no packed layout to use.
     stream_index :
         Index of the video stream to read, for files carrying more than one.
     buffer_size :
@@ -137,8 +137,9 @@ class AsyncVideoReader:
             self._shape = (n_frames, *self._shape_frame, 3)
             self._shape_chroma = None
 
-        elif self.colorspace == Colorspace.yuv420p:
+        elif self.colorspace in (Colorspace.yuv420p, Colorspace.yuv444p):
             self._shape = (n_frames, *self._shape_frame)
+            # full resolution for yuv444p, half in each direction for yuv420p
             self._shape_chroma = (
                 frame0.format.chroma_height(),
                 frame0.format.chroma_width(),
@@ -146,7 +147,8 @@ class AsyncVideoReader:
 
         n_frames = 1
 
-        self._yuv_packed = yuv_packed
+        # the packed layout is a yuv420p one, there is nothing to pack otherwise
+        self._yuv_packed = yuv_packed and self.colorspace == Colorspace.yuv420p
 
         self._shared_mems = create_shared_memory(
             frame0, n_frames=n_frames, yuv_packed=self._yuv_packed
@@ -202,7 +204,7 @@ class AsyncVideoReader:
                 "colorspace": self.colorspace,
                 "shape_frame": self._shape_frame,
                 "shape_chroma": self._shape_chroma,
-                "yuv_packed": yuv_packed,
+                "yuv_packed": self._yuv_packed,
                 "handler_kwargs": self._handler_kwargs,
                 "time_queue": self._time_queue,
                 "request_queue": self._request_queue,
@@ -341,7 +343,10 @@ class AsyncVideoReader:
                         if self.colorspace == Colorspace.rgb24 or self._yuv_packed:
                             future.set_result(self._buffer.copy())
 
-                        elif self.colorspace == Colorspace.yuv420p:
+                        elif self.colorspace in (
+                            Colorspace.yuv420p,
+                            Colorspace.yuv444p,
+                        ):
                             future.set_result(
                                 (
                                     self._buffer[0].copy(),

@@ -19,6 +19,7 @@ SharedMemYUV: TypeAlias = tuple[SharedMemory, SharedMemory, SharedMemory]
 class Colorspace(StrEnum):
     rgb24 = "rgb24"
     yuv420p = "yuv420p"
+    yuv444p = "yuv444p"
 
 
 class ReaderError(IntEnum):
@@ -51,7 +52,7 @@ def create_shared_memory(
     if colorspace == Colorspace.rgb24:
         return (SharedMemory(create=True, size=rows * cols * 3 * n_frames),)
 
-    elif colorspace == Colorspace.yuv420p:
+    elif colorspace in (Colorspace.yuv420p, Colorspace.yuv444p):
         if yuv_packed:
             # packed shape
             rows = rows * 3 // 2
@@ -59,6 +60,7 @@ def create_shared_memory(
 
         y = SharedMemory(create=True, size=rows * cols * n_frames)
 
+        # full resolution for yuv444p, half in each direction for yuv420p
         rows_chroma, cols_chroma = (
             frame.format.chroma_height(),
             frame.format.chroma_width(),
@@ -70,7 +72,7 @@ def create_shared_memory(
 
     else:
         raise ValueError(
-            f"only rgb24 and yuv420p colorspaces are currently supported, "
+            f"only rgb24, yuv420p and yuv444p colorspaces are currently supported, "
             f"provided video with colorspace: {colorspace}"
         )
 
@@ -83,7 +85,7 @@ def create_buffers(
     n_frames: int = 1,
     yuv_packed: bool = False,
 ) -> UInt8Array | TupleYUV:
-    if colorspace == Colorspace.yuv420p:
+    if colorspace in (Colorspace.yuv420p, Colorspace.yuv444p):
         if yuv_packed:
             buffer = np.ndarray(
                 shape=(n_frames, shape_frame[0] * 3 // 2, shape_frame[1]),
@@ -114,6 +116,6 @@ def create_buffers(
 
     else:
         raise ValueError(
-            f"only rgb24 and yuv420p colorspaces are currently supported, "
+            f"only rgb24, yuv420p and yuv444p colorspaces are currently supported, "
             f"provided video with colorspace: {colorspace}"
         )
