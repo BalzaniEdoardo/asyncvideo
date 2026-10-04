@@ -7,6 +7,7 @@ import numpy as np
 import pytest
 
 from asyncvideo import VideoHandler
+from asyncvideo.exceptions import _Superseded
 
 _SKIP_UNSORTED_PTS = pytest.mark.skip(
     reason="unsorted PTS / infinite-loop bug not fixed in this PR"
@@ -684,3 +685,153 @@ def test_getitem_decoupled_current_frame_and_pts_decoding_via_decode_multiple(
         frames = video_obj[12:14]
         frames = np.stack([f.to_ndarray() for f in frames])
         np.testing.assert_array_equal(frame_array[12:14], frames)
+
+
+# ---------------------------------------------------------------------------
+# Aborting a scan (abort_decoding)
+# ---------------------------------------------------------------------------
+
+# Every fixture video has a keyframe at least four frames before this one, so the
+# scan to it decodes a few frames that are not the target -- which is where the
+# abort hook is consulted.
+_ABORT_TARGET = 40
+# Read before the target, so reaching it means seeking back to its keyframe.
+_ABORT_START = 60
+
+
+class _AbortOnCheck:
+    """Abort hook that reports "superseded" on its ``n``-th check once armed."""
+
+    def __init__(self) -> None:
+        self.n: int | None = None
+        self.checks = 0
+
+    def arm(self, n: int) -> None:
+        self.n = n
+        self.checks = 0
+
+    def disarm(self) -> None:
+        self.n = None
+
+    def __call__(self) -> bool:
+        if self.n is None:
+            return False
+        self.checks += 1
+        return self.checks >= self.n
+
+
+def _keyframe_before(frame_pts, keyframe_pts, idx):
+    """Index of the last keyframe at or before frame ``idx``."""
+    return max(frame_pts.index(k) for k in keyframe_pts if frame_pts.index(k) <= idx)
+
+
+def _abort_mid_scan(video, hook, n):
+    """Leave ``video`` aborted partway through the scan to ``_ABORT_TARGET``."""
+    # the keyframe list steers _need_seek_call, so let it finish first
+    video._wait_for_index()
+    video[_ABORT_START]
+    hook.arm(n)
+    with pytest.raises(_Superseded):
+        video[_ABORT_TARGET]
+    hook.disarm()
+
+
+@pytest.mark.parametrize("video_info", CODEC_EXTENSION_COMBOS, indirect=True)
+def test_abort_raises_superseded_mid_scan(video_info):
+    """The scan stops on the first check that reports the request stale."""
+    _, frame_pts, keyframe_pts, video_path = video_info
+    assert _ABORT_TARGET - _keyframe_before(frame_pts, keyframe_pts, _ABORT_TARGET) > 3
+
+    hook = _AbortOnCheck()
+    with VideoHandler(video_path, abort_decoding=hook) as video:
+        _abort_mid_scan(video, hook, n=3)
+
+        assert hook.checks == 3, "the scan went on after the hook said to stop"
+        # an aborted request never got its frame, so it must not claim it did
+        assert video.last_loaded_idx == _ABORT_START
+        assert _ABORT_TARGET not in video._buffer
+
+
+@pytest.mark.parametrize("video_info", CODEC_EXTENSION_COMBOS, indirect=True)
+def test_abort_hook_that_never_fires_changes_nothing(video_info):
+    """A hook that is consulted but never fires leaves the read untouched."""
+    frame_array, _, _, video_path = video_info
+    hook = _AbortOnCheck()
+    hook.arm(10**9)
+    with VideoHandler(video_path, abort_decoding=hook) as video:
+        video._wait_for_index()
+        video[_ABORT_START]
+        frame = video[_ABORT_TARGET]
+
+    assert hook.checks > 0, "the scan should have consulted the hook"
+    np.testing.assert_array_equal(frame.to_ndarray(), frame_array[_ABORT_TARGET])
+
+
+@pytest.mark.parametrize("video_info", CODEC_EXTENSION_COMBOS, indirect=True)
+def test_abort_is_not_consulted_when_no_frame_is_skipped(video_info):
+    """Reading the very next frame decodes nothing else, so it cannot be aborted.
+
+    The hook is only consulted for frames decoded on the way to the target.
+    Even one that would abort at once must not stop a read that reaches its
+    target on the first frame.
+    """
+    frame_array, _, _, video_path = video_info
+    hook = _AbortOnCheck()
+    with VideoHandler(video_path, abort_decoding=hook) as video:
+        video._wait_for_index()
+        video[10]
+        hook.arm(1)
+        frame = video[11]
+
+    assert hook.checks == 0
+    np.testing.assert_array_equal(frame.to_ndarray(), frame_array[11])
+
+
+@pytest.mark.parametrize("video_info", CODEC_EXTENSION_COMBOS, indirect=True)
+def test_abort_publishes_the_last_decoded_frame(video_info):
+    """The frame decoded just before the abort is cached and is the read position."""
+    frame_array, frame_pts, keyframe_pts, video_path = video_info
+    hook = _AbortOnCheck()
+    with VideoHandler(video_path, abort_decoding=hook) as video:
+        _abort_mid_scan(video, hook, n=3)
+
+        published = frame_pts.index(video._stream_pts)
+        assert (
+            _keyframe_before(frame_pts, keyframe_pts, _ABORT_TARGET)
+            <= published
+            < _ABORT_TARGET
+        ), "the read position should sit between the keyframe and the target"
+
+        cached = video._buffer.get(published)
+        assert cached is not None, "the last decoded frame was not cached"
+        np.testing.assert_array_equal(cached.to_ndarray(), frame_array[published])
+
+
+@pytest.mark.parametrize("video_info", CODEC_EXTENSION_COMBOS, indirect=True)
+def test_abort_keeps_the_decoding_stream(video_info, monkeypatch):
+    """After an abort, a request further ahead carries on from where it stopped.
+
+    No seek and no new iterator: the frames between the abort point and the
+    target are decoded once, not again from the keyframe.
+    """
+    frame_array, frame_pts, _, video_path = video_info
+    hook = _AbortOnCheck()
+    with VideoHandler(video_path, abort_decoding=hook) as video:
+        _abort_mid_scan(video, hook, n=3)
+        published = frame_pts.index(video._stream_pts)
+        decoder = video._decoder
+        assert decoder is not None, "the abort dropped the decoder"
+
+        seeks = []
+        original_seek = video._seek
+        monkeypatch.setattr(
+            video, "_seek", lambda pts: (seeks.append(pts), original_seek(pts))
+        )
+
+        # the frame right after the abort point, then the target that was aborted
+        for idx in (published + 1, _ABORT_TARGET):
+            frame = video[idx]
+            np.testing.assert_array_equal(frame.to_ndarray(), frame_array[idx])
+
+        assert seeks == [], "resuming after an abort should not seek"
+        assert video._decoder is decoder, "resuming after an abort reopened the decoder"

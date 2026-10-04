@@ -16,6 +16,7 @@ import logging
 import multiprocessing as mp
 import os
 import queue
+import signal
 import threading
 import time
 from multiprocessing import resource_tracker
@@ -89,6 +90,19 @@ def _segment_exists(name: str) -> bool:
     return True
 
 
+def _dump_worker_stacks(worker) -> None:
+    """Make a hung forked worker print where it is stuck, then end it.
+
+    A forked child inherits pytest's faulthandler, so SIGABRT makes it write
+    every thread's Python stack to stderr before dying. Without this a hang
+    only shows up as "did not stop", with nothing to say why.
+    """
+    if os.name != "posix" or worker.pid is None:
+        return
+    os.kill(worker.pid, signal.SIGABRT)
+    worker.join(timeout=10)
+
+
 def _swap_in_stubborn_worker(reader, seconds: float):
     """Replace the reader's worker by one that ignores the stop event.
 
@@ -99,6 +113,8 @@ def _swap_in_stubborn_worker(reader, seconds: float):
     reader._stop_event.set()
     reader._request_queue.put(None)
     real.join(timeout=RELEASE_TIMEOUT)
+    if real.is_alive():
+        _dump_worker_stacks(real)
     assert not real.is_alive(), "real worker did not stop"
 
     # time.sleep pickles by reference, so this works under spawn as well

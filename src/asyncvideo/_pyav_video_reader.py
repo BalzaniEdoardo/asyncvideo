@@ -12,6 +12,7 @@ import pathlib
 import threading
 import time
 from collections import deque
+from collections.abc import Callable
 from concurrent.futures import Future
 from typing import Literal
 
@@ -20,6 +21,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from .convert import to_rgb
+from .exceptions import _Superseded
 
 logger = logging.getLogger(__name__)
 
@@ -249,6 +251,11 @@ class VideoHandler(BaseAudioVideo):
         Number of recently decoded frames to keep in the FIFO frame buffer.
         On a cache hit the frame is returned without any seeking or decoding.
         Default is 30 (roughly 1 s at 30 fps).
+    abort_decoding :
+        Called once per decoded frame while scanning towards a target. Returning
+        ``True`` stops the scan and raises ``_Superseded``; the frames decoded so
+        far stay cached and the read position is kept, so a later request can
+        carry on from there. ``None`` (the default) never aborts.
 
     Examples
     --------
@@ -277,6 +284,7 @@ class VideoHandler(BaseAudioVideo):
         stream_index: int = 0,
         time: NDArray | None = None,
         pixel_format: Literal["rgb24", "yuv420p", "yuv444p"] | None = None,
+        abort_decoding: Callable[[], bool] | None = None,
         buffer_size: int = 30,
         av_open_kwargs: dict | None = None,
     ) -> None:
@@ -353,6 +361,7 @@ class VideoHandler(BaseAudioVideo):
 
         self._index_ready = threading.Event()
         self._index_thread.start()
+        self._abort_decoding = abort_decoding
         # decode first frame
         self.__getitem__(0)
 
@@ -932,6 +941,13 @@ class VideoHandler(BaseAudioVideo):
                 current_frame = frame
                 return last_idx, current_frame, False
             preceding_frame = frame
+            # Checked only after the frame is accounted for: the iterator has
+            # already moved past it, so recording it as the read position (and
+            # keeping the iterator) is what lets the next request stream forward
+            # from here instead of seeking back to the keyframe.
+            if self._abort_decoding is not None and self._abort_decoding():
+                self._publish_decoded(frame)
+                raise _Superseded()
 
         # Falling out of the loop means the generator was exhausted, so the
         # container and codec are now at EOF. This happens routinely on B-frame
