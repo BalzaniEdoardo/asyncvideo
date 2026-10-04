@@ -41,13 +41,9 @@ def _reader_process(
     latest_rid: Synchronized,
     buffer_lock: Lock,
 ):
-    # A reader shut down right after construction gets here with the stop event
-    # already set: under spawn this process has only just finished importing its
-    # dependencies. Leave before opening the video rather than make the parent
-    # wait on work nobody needs. ``time`` is still answered, since a parent
-    # reading it is blocked on this queue.
+    # Already shut down: skip opening the video. No cancel_join_thread, so this
+    # small message is flushed before exit instead of dropped.
     if stop_event.is_set():
-        time_queue.cancel_join_thread()
         time_queue.put(("error", RuntimeError("reader was shut down")))
         return
 

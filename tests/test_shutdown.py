@@ -15,6 +15,7 @@ waits for them.
 import logging
 import multiprocessing as mp
 import os
+import queue
 import threading
 import time
 from multiprocessing import resource_tracker
@@ -357,6 +358,26 @@ def test_time_after_an_early_shutdown_does_not_hang(video_path, start_method):
     t.join(timeout=RESULT_TIMEOUT)
     assert not t.is_alive(), "reading time after shutdown hung"
     assert outcome
+
+
+def test_time_raises_when_the_worker_died_without_publishing(reader):
+    """A worker gone with nothing on the queue must not leave ``time`` waiting.
+
+    The worker can exit before its publishing thread gets the times out, e.g.
+    when shut down right after indexing started.
+    """
+    # stop the real worker, then drop whatever it may have published
+    reader.shutdown(wait=True)
+    while True:
+        try:
+            reader._time_queue.get(timeout=0.5)
+        except queue.Empty:
+            break
+
+    start = time.perf_counter()
+    with pytest.raises(RuntimeError, match="exited before publishing"):
+        _ = reader.time
+    assert time.perf_counter() - start < 2.0
 
 
 # ----------------------------------------------------------------------

@@ -372,9 +372,27 @@ class AsyncVideoReader:
         ValueError
             If a ``time`` array was given whose length does not match the number
             of frames actually found in the video.
+        RuntimeError
+            If the reader was shut down before the times were published.
         """
         if self._time is None:
-            kind, payload = self._time_queue.get()
+            # Poll rather than block: a worker that exits before publishing
+            # would otherwise leave this waiting forever.
+            while True:
+                try:
+                    kind, payload = self._time_queue.get(timeout=0.1)
+                    break
+                except _stdlib_queue.Empty:
+                    if self._worker.is_alive():
+                        continue
+                # dead worker: one last look, the message may have just landed
+                try:
+                    kind, payload = self._time_queue.get(timeout=0.1)
+                    break
+                except _stdlib_queue.Empty:
+                    raise RuntimeError(
+                        "reader process exited before publishing frame times"
+                    ) from None
             if kind == "error":
                 raise payload
             self._time = payload
