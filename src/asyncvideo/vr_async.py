@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import atexit
+import logging
 import multiprocessing
 import queue as _stdlib_queue
 import sys
 import threading
+import time as _time
+import weakref
 from concurrent.futures import Future
 from multiprocessing import Queue
 from pathlib import Path
@@ -31,6 +35,95 @@ if sys.platform == "win32":
     mp_ctx = multiprocessing.get_context("spawn")
 else:
     mp_ctx = multiprocessing.get_context("fork")
+
+logger = logging.getLogger(__name__)
+
+
+# ----------------------------------------------------------------------
+# Bounded, non-blocking teardown
+# ----------------------------------------------------------------------
+# Under the "spawn" start method (Windows) a freshly created worker is still
+# importing its dependencies and cannot observe the stop event for a second or
+# more (pynaviz#120). ``shutdown`` therefore hands the join and the release of
+# the shared memory to a helper thread by default, so closing a reader never
+# stalls the caller on it.
+# Deferring is also what keeps the release *correct*: on Windows a named mapping
+# is destroyed as soon as the last handle closes, so releasing it before the
+# worker has attached pulls it out from under the worker.
+#
+# Every wait is bounded, so a wedged worker cannot hang ``shutdown`` (or
+# interpreter exit) forever.
+
+# Upper bound on how long the helper waits for the worker to exit before
+# giving up and releasing the shared memory anyway.
+_WORKER_JOIN_TIMEOUT = 30.0
+# The listener exits as soon as it reads the sentinel, so this is generous.
+_LISTENER_JOIN_TIMEOUT = 5.0
+# Upper bound on how long interpreter exit waits for pending teardowns.
+_DRAIN_TIMEOUT = 10.0
+
+# Readers not shut down yet, closed by the exit hook. A reader's listener thread
+# holds a strong reference to it until shutdown, so in practice this does not
+# let a live reader be collected; weak only so it never keeps one alive itself.
+_live_readers: weakref.WeakSet[AsyncVideoReader] = weakref.WeakSet()
+
+# Helper threads started by ``shutdown(wait=False)`` that may still be running.
+_release_threads: set[threading.Thread] = set()
+_release_threads_lock = threading.Lock()
+
+
+def _start_release_thread(target) -> None:
+    """Run ``target`` on a tracked daemon thread, so exit can wait for it."""
+    thread = threading.Thread(target=target, name="asyncvideo-release", daemon=True)
+    with _release_threads_lock:
+        _release_threads.difference_update(
+            [t for t in _release_threads if not t.is_alive()]
+        )
+        _release_threads.add(thread)
+        # started under the lock, so a drain never sees an unstarted thread
+        # (joining one raises RuntimeError)
+        thread.start()
+
+
+def _drain_releases(timeout: float = _DRAIN_TIMEOUT) -> bool:
+    """Wait for pending teardowns. Returns False if the wait timed out."""
+    deadline = _time.monotonic() + timeout
+    with _release_threads_lock:
+        threads = list(_release_threads)
+    for thread in threads:
+        thread.join(timeout=max(0.0, deadline - _time.monotonic()))
+    return not any(t.is_alive() for t in threads)
+
+
+def _shutdown_all_readers() -> None:
+    """Exit hook: shut down every live reader and wait, bounded, for them."""
+    for reader in list(_live_readers):
+        try:
+            reader.shutdown(wait=False)
+        except Exception:
+            logger.exception("Error while shutting down %r", reader)
+    _live_readers.clear()
+    # shutdown(wait=False) returns at once, so block here -- and only here --
+    # to let the workers exit and the segments be unlinked before teardown.
+    if not _drain_releases():
+        logger.warning("Timed out waiting for video reader processes to exit")
+
+
+def _register_exit_hook() -> None:
+    """Register the exit hook once, in the main process only.
+
+    Called from the first reader's construction rather than at import: by then
+    creating the queues has imported ``multiprocessing.util``, which registers
+    its own exit hook that terminates daemonic workers. ``atexit`` runs hooks
+    last-in first-out, so registering after it lets ours run first, while the
+    workers and queues are still usable.
+    """
+    if multiprocessing.current_process().name != "MainProcess":
+        return
+    if getattr(_register_exit_hook, "_registered", False):
+        return
+    atexit.register(_shutdown_all_readers)
+    _register_exit_hook._registered = True
 
 
 class AsyncVideoReader:
@@ -218,6 +311,9 @@ class AsyncVideoReader:
         self._listener = threading.Thread(target=self._listen, daemon=True)
         self._listener.start()
 
+        _register_exit_hook()
+        _live_readers.add(self)
+
     @property
     def shared_mems(self) -> SharedMemRGB | SharedMemYUV:
         return self._shared_mems
@@ -276,9 +372,27 @@ class AsyncVideoReader:
         ValueError
             If a ``time`` array was given whose length does not match the number
             of frames actually found in the video.
+        RuntimeError
+            If the reader was shut down before the times were published.
         """
         if self._time is None:
-            kind, payload = self._time_queue.get()
+            # Poll rather than block: a worker that exits before publishing
+            # would otherwise leave this waiting forever.
+            while True:
+                try:
+                    kind, payload = self._time_queue.get(timeout=0.1)
+                    break
+                except _stdlib_queue.Empty:
+                    if self._worker.is_alive():
+                        continue
+                # dead worker: one last look, the message may have just landed
+                try:
+                    kind, payload = self._time_queue.get(timeout=0.1)
+                    break
+                except _stdlib_queue.Empty:
+                    raise RuntimeError(
+                        "reader process exited before publishing frame times"
+                    ) from None
             if kind == "error":
                 raise payload
             self._time = payload
@@ -467,7 +581,31 @@ class AsyncVideoReader:
         self._request_queue.put((self._pending_rid, selector, by_time))
         return future
 
-    def shutdown(self, wait: bool = True):
+    def shutdown(self, wait: bool = False):
+        """
+        Stop the worker process and release the shared memory.
+
+        Returns immediately by default: the worker is told to stop, and joining
+        it and releasing the memory happen on a helper thread. Safe to call
+        from a GUI thread. Idempotent.
+
+        Parameters
+        ----------
+        wait :
+            Block until the worker has exited and the memory is released. Under
+            the "spawn" start method (Windows) a worker created moments earlier
+            is still importing and cannot react to the stop request, so this can
+            take a second or more.
+
+        Notes
+        -----
+        - The memory is only released once the worker is gone. A worker that
+          has not exited within 30 s is left to finish on its own and the
+          memory is released anyway.
+        - Readers still live at interpreter exit are shut down automatically,
+          and the interpreter waits (up to 10 s) for pending teardowns.
+        """
+        _live_readers.discard(self)
         self._stop_event.set()
         self._request_queue.put(None)  # wake up the worker if blocked on get()
         if wait:
@@ -478,15 +616,36 @@ class AsyncVideoReader:
             # of it, so unmapping them while it runs is a use-after-free (a
             # segfault, not an exception). Hand the join + teardown to a helper
             # thread so the caller still returns immediately.
-            threading.Thread(target=self._release, daemon=True).start()
+            _start_release_thread(self._release)
 
     def _release(self):
         """Stop the worker and listener, then unmap and destroy the segments."""
-        self._worker.join()
+        worker = self._worker
+        worker.join(timeout=_WORKER_JOIN_TIMEOUT)
+        if worker.is_alive():
+            # Not terminated: on Windows that was seen to free the mapping out
+            # from under views still held (pynaviz#120). The worker keeps its
+            # own handle, so releasing ours below is safe; it exits on its own
+            # once it reaches the stop event.
+            logger.warning(
+                "Reader process %s did not exit within %gs; "
+                "releasing shared memory anyway",
+                worker.name,
+                _WORKER_JOIN_TIMEOUT,
+            )
+
         # only stop the listener once the worker is gone and no further results
         # can land on the queue
         self._response_queue.put(None)
-        self._listener.join()
+        self._listener.join(timeout=_LISTENER_JOIN_TIMEOUT)
+        if self._listener.is_alive():
+            # It may still be copying out of ``_buffer``: unmapping now would be
+            # a use-after-free. Leaking the segments is the lesser evil.
+            logger.warning(
+                "Listener thread of %s did not stop; leaking shared memory",
+                self._path,
+            )
+            return
 
         # Held across the whole teardown, not just the flag check: a concurrent
         # shutdown() must block until the segments are actually gone rather than
@@ -505,7 +664,10 @@ class AsyncVideoReader:
             # planar yuv. close() releases this process's mapping; unlink()
             # destroys the segment and must happen exactly once, from the owner
             # — this process created them, so it unlinks and the worker only
-            # closes.
+            # closes. One failing segment must not strand the others.
             for shm in self._shared_mems:
-                shm.close()
-                shm.unlink()
+                try:
+                    shm.close()
+                    shm.unlink()
+                except Exception:
+                    logger.exception("Unable to release shared memory %s", shm.name)

@@ -82,7 +82,7 @@ Two behaviours of `AsyncVideoReader` worth knowing before you use it:
 - **It returns one frame per request.** The shared-memory buffer holds a single frame, so a slice does not fetch a range. Results also keep a leading axis of length 1, so a converted frame is `(1, H, W, 3)` and displaying it means taking `[0]`.
 - **It supersedes in-flight requests.** If a new frame is requested while an older request is still decoding, the old one is cancelled. Dragging a slider therefore stays responsive, because the reader does not work through a backlog of frames that are no longer needed.
 
-Each reader owns a process, so remember to call `shutdown()` when you are done with it.
+Each reader owns a process, so remember to call `shutdown()` when you are done with it. It returns immediately, so it is safe to call from a GUI thread: the process is joined and the shared memory released in the background. Pass `wait=True` to block until that is done.
 
 ### Analysis: the frames for a behavioural epoch
 
