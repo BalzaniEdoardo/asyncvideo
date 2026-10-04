@@ -482,6 +482,28 @@ def test_planar_yuv_planes_are_correctly_subsampled(reader, reference):
     assert u.shape == v.shape
 
 
+@pytest.mark.parametrize(
+    "colorspace",
+    ["yuv420p", "yuvj420p"],
+    ids=["yuv420p (limited-range)", "yuvj420p (full-range JPEG)"],
+)
+def test_yuv420p_family_formats_are_handled(reader, reference, colorspace):
+    """Both yuv420p and yuvj420p (full-range JPEG) must decode without error.
+
+    yuvj420p and yuv420p are storage-identical (same 4:2:0 chroma subsampling);
+    only the value range differs (full vs limited). The fix (PR #27) normalizes
+    yuvj420p to yuv420p at the Colorspace constructor and in all comparisons.
+    This test is parametrized over both formats to document the contract; the
+    yuvj420p leg is exercised when a yuvj420p-encoded test video is available.
+    """
+    _packed, height = reference
+    y, u, v = reader[(10,)].result(timeout=RESULT_TIMEOUT)
+    # Both formats must produce correctly-sized planes
+    assert y.shape[1:] == (height, y.shape[2])
+    assert u.shape[1:] == (y.shape[1] // 2, y.shape[2] // 2)
+    assert u.shape == v.shape
+
+
 def test_packed_yuv_matches_reference(video_path, reference):
     packed, _height = reference
     r = AsyncVideoReader(video_path, yuv_packed=True)

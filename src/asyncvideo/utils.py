@@ -45,13 +45,13 @@ def create_shared_memory(
     frame: av.VideoFrame, n_frames: int = 1, yuv_packed: bool = False
 ) -> SharedMemYUV | SharedMemRGB:
     colorspace = frame.format.name
+    # yuvj420p (full-range JPEG) is storage-identical to yuv420p
+    if colorspace == "yuvj420p":
+        colorspace = "yuv420p"
 
     rows, cols = frame.height, frame.width
 
-    if colorspace == Colorspace.rgb24:
-        return (SharedMemory(create=True, size=rows * cols * 3 * n_frames),)
-
-    elif colorspace == Colorspace.yuv420p:
+    if colorspace == "yuv420p":
         if yuv_packed:
             # packed shape
             rows = rows * 3 // 2
@@ -67,6 +67,9 @@ def create_shared_memory(
         v = SharedMemory(create=True, size=rows_chroma * cols_chroma * n_frames)
 
         return y, u, v
+
+    elif colorspace == "rgb24":
+        return (SharedMemory(create=True, size=rows * cols * 3 * n_frames),)
 
     else:
         raise ValueError(
