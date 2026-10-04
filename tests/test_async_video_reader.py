@@ -11,10 +11,12 @@ import threading
 import time
 from multiprocessing.shared_memory import SharedMemory
 
+import av
 import numpy as np
 import pytest
 
 from asyncvideo import AsyncVideoReader, VideoHandler
+from asyncvideo._pyav_video_reader import pyav_trim_plane
 from asyncvideo.utils import ReaderError
 from asyncvideo.vr_async import _drain_releases as drain_releases
 from asyncvideo.vr_async import mp_ctx
@@ -482,26 +484,61 @@ def test_planar_yuv_planes_are_correctly_subsampled(reader, reference):
     assert u.shape == v.shape
 
 
-@pytest.mark.parametrize(
-    "colorspace",
-    ["yuv420p", "yuvj420p"],
-    ids=["yuv420p (limited-range)", "yuvj420p (full-range JPEG)"],
-)
-def test_yuv420p_family_formats_are_handled(reader, reference, colorspace):
-    """Both yuv420p and yuvj420p (full-range JPEG) must decode without error.
+def _write_clip(path, pix_fmt, n_frames=20, height=48, width=64):
+    """Encode a short libx264 clip in ``pix_fmt``, every frame a distinct gradient."""
+    rows, cols = np.mgrid[:height, :width].astype(np.uint16)
+    with av.open(str(path), "w") as container:
+        stream = container.add_stream("libx264", rate=30)
+        stream.width, stream.height, stream.pix_fmt = width, height, pix_fmt
+        for i in range(n_frames):
+            rgb = np.stack(
+                [(rows * 4 + i * 10) % 256, (cols * 3) % 256, (rows + cols + i) % 256],
+                axis=-1,
+            ).astype(np.uint8)
+            frame = av.VideoFrame.from_ndarray(rgb, format="rgb24")
+            for packet in stream.encode(frame.reformat(format=pix_fmt)):
+                container.mux(packet)
+        for packet in stream.encode():
+            container.mux(packet)
 
-    yuvj420p and yuv420p are storage-identical (same 4:2:0 chroma subsampling);
-    only the value range differs (full vs limited). The fix (PR #27) normalizes
-    yuvj420p to yuv420p at the Colorspace constructor and in all comparisons.
-    This test is parametrized over both formats to document the contract; the
-    yuvj420p leg is exercised when a yuvj420p-encoded test video is available.
+
+@pytest.mark.parametrize(
+    "pix_fmt",
+    ["yuv420p", "yuvj420p", "yuv444p"],
+    ids=["yuv420p (limited-range)", "yuvj420p (full-range JPEG)", "yuv444p"],
+)
+def test_yuv_formats_match_pyav_planes(tmp_path, pix_fmt):
+    """Each supported planar YUV format must come back plane-for-plane intact.
+
+    yuvj420p is storage-identical to yuv420p (only the value range differs) and
+    is normalized to it. yuv444p keeps chroma at full resolution, so its U and V
+    planes must have the luma shape rather than half of it in each direction.
     """
-    _packed, height = reference
-    y, u, v = reader[(10,)].result(timeout=RESULT_TIMEOUT)
-    # Both formats must produce correctly-sized planes
-    assert y.shape[1:] == (height, y.shape[2])
-    assert u.shape[1:] == (y.shape[1] // 2, y.shape[2] // 2)
+    path = tmp_path / f"{pix_fmt}.mp4"
+    _write_clip(path, pix_fmt)
+
+    with av.open(str(path)) as container:
+        stream = container.streams.video[0]
+        assert stream.codec_context.pix_fmt == pix_fmt
+        expected = [
+            [pyav_trim_plane(plane).copy() for plane in frame.planes]
+            for frame in container.decode(stream)
+        ]
+
+    r = AsyncVideoReader(path)
+    try:
+        assert r.colorspace == ("yuv420p" if pix_fmt == "yuvj420p" else pix_fmt)
+        y, u, v = r[(10,)].result(timeout=RESULT_TIMEOUT)
+    finally:
+        r.shutdown()
+
+    if pix_fmt == "yuv444p":
+        assert u.shape == y.shape
+    else:
+        assert u.shape[1:] == (y.shape[1] // 2, y.shape[2] // 2)
     assert u.shape == v.shape
+    for got, want in zip((y, u, v), expected[10]):
+        np.testing.assert_array_equal(got[0], want)
 
 
 def test_packed_yuv_matches_reference(video_path, reference):

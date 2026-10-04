@@ -140,7 +140,10 @@ def _reader_process(
                             buffer, pyav_trim_plane(frame.planes[0]), casting="no"
                         )
 
-                    elif frame_format == "yuv420p":
+                    elif frame_format in (
+                        Colorspace.yuv420p,
+                        Colorspace.yuv444p,
+                    ):
                         if yuv_packed:
                             np.copyto(buffer, frame.to_ndarray(), casting="no")
                         else:

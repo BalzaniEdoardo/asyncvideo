@@ -131,9 +131,13 @@ class BaseAudioVideo:
     def __init__(
         self,
         path: str | pathlib.Path,
+        av_open_kwargs: dict | None = None,
     ) -> None:
+        if av_open_kwargs is None:
+            av_open_kwargs = {}
+        self._av_open_kwargs = av_open_kwargs
         self.file_path = pathlib.Path(path)
-        self.container = av.open(path)
+        self.container = av.open(path, **av_open_kwargs)
         self._running = True
 
         # initialize index for last decoded frame
@@ -274,8 +278,9 @@ class VideoHandler(BaseAudioVideo):
         time: NDArray | None = None,
         pixel_format: Literal["rgb24", "yuv420p", "yuv444p"] | None = None,
         buffer_size: int = 30,
+        av_open_kwargs: dict | None = None,
     ) -> None:
-        super().__init__(video_path)
+        super().__init__(video_path, av_open_kwargs=av_open_kwargs)
         self._buffer = FrameBuffer(maxsize=buffer_size)
         # pts of the last frame *actually decoded* from the stream — used for
         # seek decisions.  current_frame can be updated by buffer / cache hits
@@ -417,7 +422,7 @@ class VideoHandler(BaseAudioVideo):
         keyframe_timestamp = []
         keyframe_pts = []
 
-        with av.open(video_path) as container:
+        with av.open(video_path, **self._av_open_kwargs) as container:
             stream = container.streams.video[stream_index]
             stream.codec_context.skip_frame = "NONKEY"
 
@@ -433,7 +438,7 @@ class VideoHandler(BaseAudioVideo):
 
     def _extract_keyframes_pts(self):
         try:
-            with av.open(self.file_path) as container:
+            with av.open(self.file_path, **self._av_open_kwargs) as container:
                 stream = container.streams.video[0]
                 for packet in container.demux(stream):
                     if not self._running:
@@ -448,7 +453,7 @@ class VideoHandler(BaseAudioVideo):
 
     def _build_index(self):
         try:
-            with av.open(self.file_path) as container:
+            with av.open(self.file_path, **self._av_open_kwargs) as container:
                 stream = container.streams.video[self.stream_index]
                 n_frames = stream.frames
                 ctx = stream.codec_context
