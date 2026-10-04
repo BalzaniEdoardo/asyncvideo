@@ -132,7 +132,7 @@ def _reader_process(
 
                 # re-check after decode (decode can be slow; a newer request may
                 # have arrived in the meantime)
-                if rid < latest_rid.value:
+                if guard.superseded():
                     continue
 
                 # TODO: Deal with n_frames changing
@@ -146,7 +146,7 @@ def _reader_process(
                     # final check before writing; if we've been superseded, don't
                     # clobber the buffer for whatever rid the listener may still
                     # be mid-read on
-                    if rid < latest_rid.value:
+                    if guard.superseded():
                         continue
 
                     if frame.format.name == Colorspace.rgb24:
