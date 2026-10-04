@@ -41,6 +41,16 @@ def _reader_process(
     latest_rid: Synchronized,
     buffer_lock: Lock,
 ):
+    # A reader shut down right after construction gets here with the stop event
+    # already set: under spawn this process has only just finished importing its
+    # dependencies. Leave before opening the video rather than make the parent
+    # wait on work nobody needs. ``time`` is still answered, since a parent
+    # reading it is blocked on this queue.
+    if stop_event.is_set():
+        time_queue.cancel_join_thread()
+        time_queue.put(("error", RuntimeError("reader was shut down")))
+        return
+
     # handler_kwargs carries the caller's stream_index / time / buffer_size, so
     # this handler resolves timestamps against the same clock as the parent's
     vr = VideoHandler(path, pixel_format=None, **handler_kwargs)
