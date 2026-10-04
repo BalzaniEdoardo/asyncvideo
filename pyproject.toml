@@ -32,7 +32,7 @@ dev = [
 # needed to run the examples and build the docs, not to use the package
 docs = [
     "matplotlib",
-    "fastplotlib",
+    "fastplotlib[imgui]",
     "glfw",  # windowing backend fastplotlib renders into
     "pooch",  # downloads and hash-verifies the example clips
     "tqdm",  # download progress bar

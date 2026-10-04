@@ -21,23 +21,26 @@ import fastplotlib as fpl
 from asyncvideo import AsyncVideoReader
 from asyncvideo.fetch import fetch_video
 
-CAMERA = "body"
+CAMERA_LIST = ["body", "left", "right"]
 
 # fetch video and get the path
-path = fetch_video(CAMERA)
-reader = AsyncVideoReader(path)
+videos = {}  # this was undefined, so I created a video dict
+for cam in CAMERA_LIST:
+    path = fetch_video(cam)
+    videos[cam] = AsyncVideoReader(path)
 
 # reference space is seconds, one step per frame
-time = videos["yuv420p"].time
+time = videos["body"].time
 ranges = {"time": (time[0], time[-1], time[1] - time[0])}
 
 ndw = fpl.NDWidget(
     ranges=ranges,
+    shape=(1, 3),  # this was needed because i could not use the syntax ndw[name]
 )
 
-for name, video in videos.items():
-    ndw[name].add_video(
-        reader,
+for i, (name, video) in enumerate(videos.items()):
+    ndw[0, i].add_video(
+        video,
         dims=("time", "m", "n"),
         display_dims=("m", "n"),
         colorspace=video.colorspace,
@@ -45,8 +48,8 @@ for name, video in videos.items():
         name="video",
     )
     # neither the pixel values nor a row/col axis are interesting for a video
-    ndw[name].subplot.tooltip.enabled = False
-    ndw[name].subplot.axes.visible = False
+    ndw[0, i].subplot.tooltip.enabled = False
+    ndw[0, i].subplot.axes.visible = False
 
 ndw.show()
 
