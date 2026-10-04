@@ -125,12 +125,16 @@ def _reader_process(
                     if rid < latest_rid.value:
                         continue
 
-                    if frame.format.name == Colorspace.rgb24:
+                    frame_format = frame.format.name
+                    # yuvj420p (full-range JPEG) is storage-identical to yuv420p
+                    if frame_format == "yuvj420p":
+                        frame_format = "yuv420p"
+                    if frame_format == "rgb24":
                         np.copyto(
                             buffer, pyav_trim_plane(frame.planes[0]), casting="no"
                         )
 
-                    elif frame.format.name == Colorspace.yuv420p:
+                    elif frame_format == "yuv420p":
                         if yuv_packed:
                             np.copyto(buffer, frame.to_ndarray(), casting="no")
                         else:

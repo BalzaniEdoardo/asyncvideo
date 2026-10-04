@@ -127,7 +127,11 @@ class AsyncVideoReader:
         self._shape_frame = frame0.height, frame0.width
         n_frames = vr.shape[0]
 
-        colorspace = Colorspace(frame0.format.name)
+        frame_format = frame0.format.name
+        # yuvj420p (full-range JPEG) is storage-identical to yuv420p (limited-range)
+        if frame_format == "yuvj420p":
+            frame_format = "yuv420p"
+        colorspace = Colorspace(frame_format)
 
         self._colorspace = colorspace
         frame0_numpy = frame0.to_ndarray()
