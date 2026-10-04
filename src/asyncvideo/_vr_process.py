@@ -10,6 +10,7 @@ import av
 import numpy as np
 
 from ._pyav_video_reader import VideoHandler, pyav_trim_plane
+from .exceptions import _Superseded
 from .utils import Colorspace, ReaderError, SharedMemRGB, SharedMemYUV, create_buffers
 
 logger = logging.getLogger(__name__)
@@ -24,6 +25,20 @@ _ERROR_CODES: dict[type[BaseException], ReaderError] = {
     MemoryError: ReaderError.memory_error,
     OSError: ReaderError.os_error,
 }
+
+
+class _RequestGuard:
+    """Mark superseded requests.
+
+    Used for interrupting decoding loop at new request.
+    """
+
+    def __init__(self, latest_rid: Synchronized) -> None:
+        self._latest_rid = latest_rid  # shared with the parent, bumped on every submit
+        self.rid = 0  # the request being served; set by the worker loop
+
+    def superseded(self) -> bool:
+        return self.rid < self._latest_rid.value
 
 
 def _reader_process(
@@ -49,7 +64,8 @@ def _reader_process(
 
     # handler_kwargs carries the caller's stream_index / time / buffer_size, so
     # this handler resolves timestamps against the same clock as the parent's
-    vr = VideoHandler(path, pixel_format=None, **handler_kwargs)
+    guard = _RequestGuard(latest_rid)
+    vr = VideoHandler(path, pixel_format=None, abort_decoding=guard.superseded, **handler_kwargs)
 
     # Publish the frame times once, from a helper thread: reading ``vr.time``
     # blocks until indexing completes, and doing that on the request loop would
@@ -95,11 +111,13 @@ def _reader_process(
                 break
 
             rid, selector, by_time = request
+            # update guard
+            guard.rid = rid
 
             # skip if a newer request has already been submitted - precise
             # per-rid check, unlike a single shared cancel bit which can't
             # distinguish which request was cancelled
-            if rid < latest_rid.value:
+            if guard.superseded():
                 continue
 
             try:
@@ -159,6 +177,8 @@ def _reader_process(
                     response_queue.put((rid, ReaderError.ok))
 
             except Exception as exc:
+                if isinstance(exc, _Superseded):
+                    continue
                 # A failed request must never kill the worker: the parent is
                 # blocked on a future that only this loop can resolve, so dying
                 # here turns any bug into a permanent hang. Report the category
