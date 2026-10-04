@@ -6,9 +6,10 @@ yet -- under the "spawn" start method it is still importing its dependencies --
 so it cannot observe the stop event, and the join burned its full timeout on
 the GUI thread every time.
 
-Here ``shutdown(wait=False)`` hands the join and the release of the shared
-memory to a tracked helper thread, every wait is bounded, and readers still
-live at interpreter exit are shut down by an exit hook that waits for them.
+Here ``shutdown`` returns immediately by default: the join and the release
+of the shared memory run on a tracked helper thread, every wait is bounded,
+and readers still live at interpreter exit are shut down by an exit hook that
+waits for them.
 """
 
 import logging
@@ -24,8 +25,8 @@ import pytest
 from asyncvideo import AsyncVideoReader, vr_async
 from asyncvideo._vr_process import _reader_process
 
-# ``shutdown(wait=False)`` only signals and starts a thread. Anything near the
-# old 2 s join means the regression is back.
+# ``shutdown`` only signals and starts a thread. Anything near the old 2 s
+# join means the regression is back.
 MAX_SHUTDOWN_SECONDS = 0.5
 
 # A stub worker lifetime deliberately longer than the old 2 s join timeout, so
@@ -63,7 +64,7 @@ def reader(video_path):
     try:
         yield r
     finally:
-        r.shutdown()
+        r.shutdown(wait=True)
 
 
 def _segment_names(reader) -> tuple[str, ...]:
@@ -111,13 +112,16 @@ def _swap_in_stubborn_worker(reader, seconds: float):
 # ----------------------------------------------------------------------
 
 
-def test_wait_false_does_not_wait_for_a_worker_that_ignores_the_stop_event(reader):
-    """The regression, deterministically: a worker outliving the old timeout."""
+def test_shutdown_does_not_wait_for_a_worker_that_ignores_the_stop_event(reader):
+    """pynaviz#120, deterministically: a worker outliving the old timeout.
+
+    Called with no arguments, as a GUI closing a video would.
+    """
     worker = _swap_in_stubborn_worker(reader, SLOW_WORKER_SECONDS)
     names = _segment_names(reader)
 
     start = time.perf_counter()
-    reader.shutdown(wait=False)
+    reader.shutdown()
     elapsed = time.perf_counter() - start
 
     assert elapsed < MAX_SHUTDOWN_SECONDS, f"shutdown blocked for {elapsed:.2f}s"
@@ -128,14 +132,14 @@ def test_wait_false_does_not_wait_for_a_worker_that_ignores_the_stop_event(reade
     # The helper thread, not the caller, completes the teardown.
     assert vr_async._drain_releases(timeout=RELEASE_TIMEOUT)
     assert not worker.is_alive()
-    assert worker.exitcode == 0, "worker was terminated instead of joined"
+    assert worker.exitcode == 0, "worker was killed instead of joined"
     assert not any(_segment_exists(n) for n in names)
 
 
 def test_release_thread_is_a_tracked_daemon(reader):
     """The helper must never keep the interpreter alive, and exit must see it."""
     _swap_in_stubborn_worker(reader, 1.0)
-    reader.shutdown(wait=False)
+    reader.shutdown()
 
     with vr_async._release_threads_lock:
         threads = list(vr_async._release_threads)
@@ -144,23 +148,27 @@ def test_release_thread_is_a_tracked_daemon(reader):
     assert all(t.name == "asyncvideo-release" for t in threads)
 
 
-def test_wait_true_terminates_a_worker_that_overruns_its_join(
+def test_release_frees_memory_when_the_worker_overruns_its_join(
     reader, monkeypatch, caplog
 ):
-    """A worker that will not exit must not hang ``shutdown`` forever."""
+    """A worker that will not exit must not strand the memory forever.
+
+    It is left running rather than terminated: on Windows terminating it was
+    seen to free the mapping out from under views still held (pynaviz#120).
+    """
     monkeypatch.setattr(vr_async, "_WORKER_JOIN_TIMEOUT", 0.2)
     worker = _swap_in_stubborn_worker(reader, SLOW_WORKER_SECONDS)
     names = _segment_names(reader)
 
-    start = time.perf_counter()
     with caplog.at_level(logging.WARNING, logger=vr_async.__name__):
-        reader.shutdown()
-    elapsed = time.perf_counter() - start
+        reader.shutdown(wait=True)
 
-    assert elapsed < SLOW_WORKER_SECONDS, f"waited out the worker ({elapsed:.2f}s)"
-    assert "did not exit within" in caplog.text
-    assert not worker.is_alive()
+    assert "releasing shared memory anyway" in caplog.text
+    assert worker.is_alive(), "worker was killed"
     assert not any(_segment_exists(n) for n in names)
+
+    worker.join(timeout=RELEASE_TIMEOUT)
+    assert worker.exitcode == 0
 
 
 class _StuckThread:
@@ -182,7 +190,7 @@ def test_release_leaks_memory_rather_than_unmapping_under_a_live_listener(
     reader._listener = _StuckThread()
 
     with caplog.at_level(logging.WARNING, logger=vr_async.__name__):
-        reader.shutdown()
+        reader.shutdown(wait=True)
 
     assert "did not stop; leaking shared memory" in caplog.text
     assert not reader._released
@@ -191,7 +199,7 @@ def test_release_leaks_memory_rather_than_unmapping_under_a_live_listener(
     # the sentinel still reached the real listener; a retry now releases
     real_listener.join(timeout=RELEASE_TIMEOUT)
     reader._listener = real_listener
-    reader.shutdown()
+    reader.shutdown(wait=True)
     assert not any(_segment_exists(n) for n in names)
 
 
@@ -215,17 +223,17 @@ def test_release_reports_a_failing_segment_and_still_frees_the_others(
     reader._shared_mems = (_RaisingShm(), *reader._shared_mems)
 
     with caplog.at_level(logging.ERROR, logger=vr_async.__name__):
-        reader.shutdown()
+        reader.shutdown(wait=True)
 
     assert "Unable to release shared memory unreleasable" in caplog.text
     assert not any(_segment_exists(n) for n in names)
 
 
-def test_wait_false_then_wait_true_releases_exactly_once(reader):
+def test_deferred_then_blocking_shutdown_releases_exactly_once(reader):
     """A blocking shutdown racing a deferred one must not re-unlink."""
     names = _segment_names(reader)
-    reader.shutdown(wait=False)
-    reader.shutdown()  # must neither raise nor return before the release
+    reader.shutdown()
+    reader.shutdown(wait=True)  # must neither raise nor return before release
     assert reader._released
     assert not any(_segment_exists(n) for n in names)
 
@@ -276,7 +284,7 @@ def test_worker_and_shared_memory_are_created(video_path, start_method):
         assert all(_segment_exists(n) for n in _segment_names(r))
         assert r in vr_async._live_readers
     finally:
-        r.shutdown()
+        r.shutdown(wait=True)
     assert r not in vr_async._live_readers
 
 
@@ -287,7 +295,7 @@ def test_shutdown_immediately_after_construction_returns_promptly(
     r = AsyncVideoReader(video_path)
 
     start = time.perf_counter()
-    r.shutdown(wait=False)
+    r.shutdown()
     elapsed = time.perf_counter() - start
 
     assert elapsed < MAX_SHUTDOWN_SECONDS, f"shutdown blocked for {elapsed:.2f}s"
@@ -302,7 +310,7 @@ def test_shutdown_tears_down_worker_listener_and_memory(video_path, start_method
     names = _segment_names(r)
     time.sleep(0.2)  # close while the worker is still coming up
 
-    r.shutdown(wait=False)
+    r.shutdown()
     assert r._stop_event.is_set()
     assert vr_async._drain_releases(timeout=RELEASE_TIMEOUT)
 
@@ -322,7 +330,7 @@ def test_repeated_open_shutdown_cycles(video_path, start_method):
         time.sleep(0.1)
 
         start = time.perf_counter()
-        r.shutdown(wait=False)
+        r.shutdown()
         elapsed = time.perf_counter() - start
         assert elapsed < MAX_SHUTDOWN_SECONDS, f"shutdown blocked for {elapsed:.2f}s"
 
@@ -334,7 +342,7 @@ def test_repeated_open_shutdown_cycles(video_path, start_method):
 def test_time_after_an_early_shutdown_does_not_hang(video_path, start_method):
     """``time`` is answered whether or not the worker got to open the video."""
     r = AsyncVideoReader(video_path)
-    r.shutdown()
+    r.shutdown(wait=True)
 
     outcome = []
 

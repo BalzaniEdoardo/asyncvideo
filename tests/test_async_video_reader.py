@@ -16,6 +16,7 @@ import pytest
 
 from asyncvideo import AsyncVideoReader, VideoHandler
 from asyncvideo.utils import ReaderError
+from asyncvideo.vr_async import _drain_releases as drain_releases
 from asyncvideo.vr_async import mp_ctx
 
 # Long enough for a cold decode on a slow CI runner, short enough that a genuine
@@ -344,7 +345,7 @@ def test_shutdown_without_reading_time_does_not_hang(video_path):
     started = time.monotonic()
     r = AsyncVideoReader(video_path)
     r[10].result(timeout=RESULT_TIMEOUT)
-    r.shutdown()  # never touched r.time
+    r.shutdown(wait=True)  # never touched r.time
     assert time.monotonic() - started < RELEASE_TIMEOUT
 
 
@@ -532,6 +533,7 @@ def test_shutdown_unlinks_all_segments(reader):
     assert names  # guard against the fixture silently changing shape
 
     reader.shutdown()
+    assert drain_releases(RELEASE_TIMEOUT), "deferred teardown never completed"
 
     for name in names:
         _assert_segment_removed(name)
@@ -543,6 +545,7 @@ def test_shutdown_is_idempotent(reader):
 
     reader.shutdown()
     reader.shutdown()
+    assert drain_releases(RELEASE_TIMEOUT), "deferred teardown never completed"
 
     for name in names:
         _assert_segment_removed(name)
@@ -589,7 +592,7 @@ def test_concurrent_shutdown_blocks_and_releases_exactly_once(reader):
 
     def call_shutdown():
         try:
-            reader.shutdown()
+            reader.shutdown(wait=True)
         except BaseException as exc:  # noqa: BLE001 - recorded, asserted on below
             errors.append(exc)
 
@@ -619,8 +622,10 @@ def test_concurrent_shutdown_blocks_and_releases_exactly_once(reader):
         _assert_segment_removed(name)
 
 
-def test_shutdown_wait_false_returns_promptly_and_still_releases(reader):
-    """``wait=False`` must not block, but must still tear down eventually.
+def test_shutdown_returns_promptly_and_still_releases(reader):
+    """``shutdown`` must not block by default, but must still tear down.
+
+    Blocking on the worker froze GUIs closing a video under spawn (pynaviz#120).
 
     The teardown cannot run inline: ``_buffer`` is a numpy view onto the shared
     segments and the listener thread may still be copying out of it, so
@@ -629,10 +634,10 @@ def test_shutdown_wait_false_returns_promptly_and_still_releases(reader):
     names = _segment_names(reader)
 
     started = time.monotonic()
-    reader.shutdown(wait=False)
+    reader.shutdown()
     elapsed = time.monotonic() - started
 
-    assert elapsed < 1.0, f"wait=False blocked for {elapsed:.2f}s"
+    assert elapsed < 1.0, f"shutdown blocked for {elapsed:.2f}s"
 
     # the deferred teardown runs on a helper thread; give it a bounded window
     assert _wait_until(lambda: reader._released, RELEASE_TIMEOUT), (

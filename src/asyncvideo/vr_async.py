@@ -44,8 +44,9 @@ logger = logging.getLogger(__name__)
 # ----------------------------------------------------------------------
 # Under the "spawn" start method (Windows) a freshly created worker is still
 # importing its dependencies and cannot observe the stop event for a second or
-# more. ``shutdown(wait=False)`` therefore hands the join and the release of the
-# shared memory to a helper thread, so a GUI closing a reader never stalls on it.
+# more (pynaviz#120). ``shutdown`` therefore hands the join and the release of
+# the shared memory to a helper thread by default, so closing a reader never
+# stalls the caller on it.
 # Deferring is also what keeps the release *correct*: on Windows a named mapping
 # is destroyed as soon as the last handle closes, so releasing it before the
 # worker has attached pulls it out from under the worker.
@@ -53,10 +54,9 @@ logger = logging.getLogger(__name__)
 # Every wait is bounded, so a wedged worker cannot hang ``shutdown`` (or
 # interpreter exit) forever.
 
-# How long to wait for the worker to exit on its own before terminating it.
+# Upper bound on how long the helper waits for the worker to exit before
+# giving up and releasing the shared memory anyway.
 _WORKER_JOIN_TIMEOUT = 30.0
-# How long to wait for the worker to die once terminated.
-_WORKER_TERMINATE_TIMEOUT = 5.0
 # The listener exits as soon as it reads the sentinel, so this is generous.
 _LISTENER_JOIN_TIMEOUT = 5.0
 # Upper bound on how long interpreter exit waits for pending teardowns.
@@ -563,26 +563,29 @@ class AsyncVideoReader:
         self._request_queue.put((self._pending_rid, selector, by_time))
         return future
 
-    def shutdown(self, wait: bool = True):
+    def shutdown(self, wait: bool = False):
         """
         Stop the worker process and release the shared memory.
 
-        Idempotent: later calls are no-ops once the segments are released.
+        Returns immediately by default: the worker is told to stop, and joining
+        it and releasing the memory happen on a helper thread. Safe to call
+        from a GUI thread. Idempotent.
 
         Parameters
         ----------
         wait :
-            Block until the worker has exited and the memory is released. Pass
-            ``False`` from a GUI thread: the teardown then runs on a helper
-            thread and this returns at once. Under the "spawn" start method
-            (Windows) a worker created moments earlier is still importing and
-            cannot react to the stop request for a second or more.
+            Block until the worker has exited and the memory is released. Under
+            the "spawn" start method (Windows) a worker created moments earlier
+            is still importing and cannot react to the stop request, so this can
+            take a second or more.
 
         Notes
         -----
-        - A worker that does not exit within 30 s is terminated, so this never
-          blocks indefinitely.
-        - Readers still live at interpreter exit are shut down automatically.
+        - The memory is only released once the worker is gone. A worker that
+          has not exited within 30 s is left to finish on its own and the
+          memory is released anyway.
+        - Readers still live at interpreter exit are shut down automatically,
+          and the interpreter waits (up to 10 s) for pending teardowns.
         """
         _live_readers.discard(self)
         self._stop_event.set()
@@ -602,13 +605,16 @@ class AsyncVideoReader:
         worker = self._worker
         worker.join(timeout=_WORKER_JOIN_TIMEOUT)
         if worker.is_alive():
+            # Not terminated: on Windows that was seen to free the mapping out
+            # from under views still held (pynaviz#120). The worker keeps its
+            # own handle, so releasing ours below is safe; it exits on its own
+            # once it reaches the stop event.
             logger.warning(
-                "Reader process %s did not exit within %gs; terminating it",
+                "Reader process %s did not exit within %gs; "
+                "releasing shared memory anyway",
                 worker.name,
                 _WORKER_JOIN_TIMEOUT,
             )
-            worker.terminate()
-            worker.join(timeout=_WORKER_TERMINATE_TIMEOUT)
 
         # only stop the listener once the worker is gone and no further results
         # can land on the queue
