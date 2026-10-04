@@ -1,4 +1,4 @@
-"""Play a video in fastplotlib without ever blocking the render loop.
+"""Play a video in a fastplotlib ndwidget without ever blocking the render loop.
 
 The point of `AsyncVideoReader` is that requesting a frame returns immediately, so
 the interesting part here is what ``update`` does *not* do: it never calls
@@ -21,44 +21,37 @@ import fastplotlib as fpl
 from asyncvideo import AsyncVideoReader
 from asyncvideo.fetch import fetch_video
 
-CAMERA = "body"
+CAMERA_LIST = ["body", "left", "right"]
 
 # fetch video and get the path
-path = fetch_video(CAMERA)
-reader = AsyncVideoReader(path)
-n_frames = reader.shape[0]
+videos = {}  # this was undefined, so I created a video dict
+for cam in CAMERA_LIST:
+    path = fetch_video(cam)
+    videos[cam] = AsyncVideoReader(path)
 
-figure = fpl.Figure(size=(700, 560))
-# seed the graphic with frame 0. to_rgb converts the reader's native YUV output,
-# and [0] drops the leading single-frame axis.
-image = figure[0, 0].add_image(reader.to_rgb(reader[0].result())[0])
+# reference space is seconds, one step per frame
+time = videos["body"].time
+ranges = {"time": (time[0], time[-1], time[1] - time[0])}
 
-# One request is in flight at a time. ``pending`` is that request, or None.
-state = {"frame": 0, "pending": None}
+ndw = fpl.NDWidget(
+    ranges=ranges,
+    shape=(1, 3),  # this was needed because i could not use the syntax ndw[name]
+)
 
+for i, (name, video) in enumerate(videos.items()):
+    ndw[0, i].add_video(
+        video,
+        dims=("time", "m", "n"),
+        display_dims=("m", "n"),
+        colorspace=video.colorspace,
+        slider_maps={"time": video.time},
+        name="video",
+    )
+    # neither the pixel values nor a row/col axis are interesting for a video
+    ndw[0, i].subplot.tooltip.enabled = False
+    ndw[0, i].subplot.axes.visible = False
 
-def update(figure):
-    """Advance one frame per render tick, without ever waiting for a decode."""
-    pending = state["pending"]
+ndw.show()
 
-    # still decoding: draw nothing, try again on the next tick
-    if pending is not None and not pending.done():
-        return
-
-    # the frame arrived, so show it
-    if pending is not None:
-        image.data = reader.to_rgb(pending.result())[0]
-
-    # ask for the next one and return immediately
-    state["frame"] = (state["frame"] + 1) % n_frames
-    state["pending"] = reader[state["frame"]]
-
-
-figure.add_animations(update)
-
-try:
-    figure.show()
+if __name__ == "__main__":
     fpl.loop.run()
-finally:
-    # the reader owns a process, so it has to be shut down
-    reader.shutdown()

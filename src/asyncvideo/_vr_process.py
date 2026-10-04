@@ -41,6 +41,12 @@ def _reader_process(
     latest_rid: Synchronized,
     buffer_lock: Lock,
 ):
+    # Already shut down: skip opening the video. No cancel_join_thread, so this
+    # small message is flushed before exit instead of dropped.
+    if stop_event.is_set():
+        time_queue.put(("error", RuntimeError("reader was shut down")))
+        return
+
     # handler_kwargs carries the caller's stream_index / time / buffer_size, so
     # this handler resolves timestamps against the same clock as the parent's
     vr = VideoHandler(path, pixel_format=None, **handler_kwargs)
@@ -125,12 +131,16 @@ def _reader_process(
                     if rid < latest_rid.value:
                         continue
 
-                    if frame.format.name == Colorspace.rgb24:
+                    frame_format = frame.format.name
+                    # yuvj420p (full-range JPEG) is storage-identical to yuv420p
+                    if frame_format == "yuvj420p":
+                        frame_format = "yuv420p"
+                    if frame_format == "rgb24":
                         np.copyto(
                             buffer, pyav_trim_plane(frame.planes[0]), casting="no"
                         )
 
-                    elif frame.format.name in (
+                    elif frame_format in (
                         Colorspace.yuv420p,
                         Colorspace.yuv444p,
                     ):

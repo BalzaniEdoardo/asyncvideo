@@ -11,11 +11,14 @@ import threading
 import time
 from multiprocessing.shared_memory import SharedMemory
 
+import av
 import numpy as np
 import pytest
 
 from asyncvideo import AsyncVideoReader, VideoHandler
+from asyncvideo._pyav_video_reader import pyav_trim_plane
 from asyncvideo.utils import ReaderError
+from asyncvideo.vr_async import _drain_releases as drain_releases
 from asyncvideo.vr_async import mp_ctx
 
 # Long enough for a cold decode on a slow CI runner, short enough that a genuine
@@ -344,7 +347,7 @@ def test_shutdown_without_reading_time_does_not_hang(video_path):
     started = time.monotonic()
     r = AsyncVideoReader(video_path)
     r[10].result(timeout=RESULT_TIMEOUT)
-    r.shutdown()  # never touched r.time
+    r.shutdown(wait=True)  # never touched r.time
     assert time.monotonic() - started < RELEASE_TIMEOUT
 
 
@@ -481,6 +484,63 @@ def test_planar_yuv_planes_are_correctly_subsampled(reader, reference):
     assert u.shape == v.shape
 
 
+def _write_clip(path, pix_fmt, n_frames=20, height=48, width=64):
+    """Encode a short libx264 clip in ``pix_fmt``, every frame a distinct gradient."""
+    rows, cols = np.mgrid[:height, :width].astype(np.uint16)
+    with av.open(str(path), "w") as container:
+        stream = container.add_stream("libx264", rate=30)
+        stream.width, stream.height, stream.pix_fmt = width, height, pix_fmt
+        for i in range(n_frames):
+            rgb = np.stack(
+                [(rows * 4 + i * 10) % 256, (cols * 3) % 256, (rows + cols + i) % 256],
+                axis=-1,
+            ).astype(np.uint8)
+            frame = av.VideoFrame.from_ndarray(rgb, format="rgb24")
+            for packet in stream.encode(frame.reformat(format=pix_fmt)):
+                container.mux(packet)
+        for packet in stream.encode():
+            container.mux(packet)
+
+
+@pytest.mark.parametrize(
+    "pix_fmt",
+    ["yuv420p", "yuvj420p", "yuv444p"],
+    ids=["yuv420p (limited-range)", "yuvj420p (full-range JPEG)", "yuv444p"],
+)
+def test_yuv_formats_match_pyav_planes(tmp_path, pix_fmt):
+    """Each supported planar YUV format must come back plane-for-plane intact.
+
+    yuvj420p is storage-identical to yuv420p (only the value range differs) and
+    is normalized to it. yuv444p keeps chroma at full resolution, so its U and V
+    planes must have the luma shape rather than half of it in each direction.
+    """
+    path = tmp_path / f"{pix_fmt}.mp4"
+    _write_clip(path, pix_fmt)
+
+    with av.open(str(path)) as container:
+        stream = container.streams.video[0]
+        assert stream.codec_context.pix_fmt == pix_fmt
+        expected = [
+            [pyav_trim_plane(plane).copy() for plane in frame.planes]
+            for frame in container.decode(stream)
+        ]
+
+    r = AsyncVideoReader(path)
+    try:
+        assert r.colorspace == ("yuv420p" if pix_fmt == "yuvj420p" else pix_fmt)
+        y, u, v = r[(10,)].result(timeout=RESULT_TIMEOUT)
+    finally:
+        r.shutdown()
+
+    if pix_fmt == "yuv444p":
+        assert u.shape == y.shape
+    else:
+        assert u.shape[1:] == (y.shape[1] // 2, y.shape[2] // 2)
+    assert u.shape == v.shape
+    for got, want in zip((y, u, v), expected[10]):
+        np.testing.assert_array_equal(got[0], want)
+
+
 def test_packed_yuv_matches_reference(video_path, reference):
     packed, _height = reference
     r = AsyncVideoReader(video_path, yuv_packed=True)
@@ -532,6 +592,7 @@ def test_shutdown_unlinks_all_segments(reader):
     assert names  # guard against the fixture silently changing shape
 
     reader.shutdown()
+    assert drain_releases(RELEASE_TIMEOUT), "deferred teardown never completed"
 
     for name in names:
         _assert_segment_removed(name)
@@ -543,6 +604,7 @@ def test_shutdown_is_idempotent(reader):
 
     reader.shutdown()
     reader.shutdown()
+    assert drain_releases(RELEASE_TIMEOUT), "deferred teardown never completed"
 
     for name in names:
         _assert_segment_removed(name)
@@ -589,7 +651,7 @@ def test_concurrent_shutdown_blocks_and_releases_exactly_once(reader):
 
     def call_shutdown():
         try:
-            reader.shutdown()
+            reader.shutdown(wait=True)
         except BaseException as exc:  # noqa: BLE001 - recorded, asserted on below
             errors.append(exc)
 
@@ -619,8 +681,10 @@ def test_concurrent_shutdown_blocks_and_releases_exactly_once(reader):
         _assert_segment_removed(name)
 
 
-def test_shutdown_wait_false_returns_promptly_and_still_releases(reader):
-    """``wait=False`` must not block, but must still tear down eventually.
+def test_shutdown_returns_promptly_and_still_releases(reader):
+    """``shutdown`` must not block by default, but must still tear down.
+
+    Blocking on the worker froze GUIs closing a video under spawn (pynaviz#120).
 
     The teardown cannot run inline: ``_buffer`` is a numpy view onto the shared
     segments and the listener thread may still be copying out of it, so
@@ -629,10 +693,10 @@ def test_shutdown_wait_false_returns_promptly_and_still_releases(reader):
     names = _segment_names(reader)
 
     started = time.monotonic()
-    reader.shutdown(wait=False)
+    reader.shutdown()
     elapsed = time.monotonic() - started
 
-    assert elapsed < 1.0, f"wait=False blocked for {elapsed:.2f}s"
+    assert elapsed < 1.0, f"shutdown blocked for {elapsed:.2f}s"
 
     # the deferred teardown runs on a helper thread; give it a bounded window
     assert _wait_until(lambda: reader._released, RELEASE_TIMEOUT), (
