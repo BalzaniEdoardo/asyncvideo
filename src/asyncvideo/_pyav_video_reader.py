@@ -149,6 +149,12 @@ class BaseAudioVideo:
 
         self._lock = threading.Lock()
 
+        # True when PTS are predicted from the container's own index (see
+        # VideoHandler.__init__); routes the estimates used before demuxing ends.
+        self._pts_from_dts = False
+        self._predicted_pts: NDArray | None = None
+        self._predicted_keyframe_pts: NDArray | None = None
+
         self._keyframe_pts = []
         self._pts_keyframe_ready = threading.Event()
         self._keyframe_thread = threading.Thread(
@@ -169,7 +175,13 @@ class BaseAudioVideo:
             return True
 
         with self._lock:
-            if len(self._keyframe_pts) == 0:
+            complete = self._pts_keyframe_ready.is_set()
+            if not complete and self._pts_from_dts:
+                # the container index lists every keyframe already
+                keyframe_pts, complete = self._predicted_keyframe_pts, True
+            else:
+                keyframe_pts = np.asarray(self._keyframe_pts)
+            if len(keyframe_pts) == 0:
                 return True
             # While the keyframe thread is still running we may not yet know
             # about a keyframe that sits between current position and target.
@@ -177,10 +189,7 @@ class BaseAudioVideo:
             # Once the thread is done the list is complete: no keyframe beyond
             # the last known one exists, so the absence of one is not a reason
             # to seek — we can stream forward safely.
-            if (
-                not self._pts_keyframe_ready.is_set()
-                and self._keyframe_pts[-1] < target_frame_pts
-            ):
+            if not complete and keyframe_pts[-1] < target_frame_pts:
                 return True
 
         # roll back the stream if audiovideo is scrolled backwards
@@ -188,8 +197,8 @@ class BaseAudioVideo:
             return True
 
         # find the closest keyframe pts before a given frame
-        idx = np.searchsorted(self._keyframe_pts, target_frame_pts, side="right")
-        closest_keyframe_pts = self._keyframe_pts[max(0, idx - 1)]
+        idx = np.searchsorted(keyframe_pts, target_frame_pts, side="right")
+        closest_keyframe_pts = keyframe_pts[max(0, idx - 1)]
 
         # seek forward only if there is a keyframe between current position
         # and the target (i.e. a closer starting point exists).
@@ -302,6 +311,18 @@ class VideoHandler(BaseAudioVideo):
         self.stream_index = stream_index
         self.pixel_format = pixel_format
 
+        # mp4, mov and avi list the DTS of every frame in their header. Where that
+        # list is complete, frame PTS are predicted from it right away instead of
+        # waiting for the index thread, whose demux downloads the whole file when
+        # streaming. mkv, webm, mpg and fragmented mp4 list few or no frames.
+        # Copied now: index_entries are live views and change while demuxing.
+        entries = self.stream.index_entries
+        entry_dts, entry_key_dts = None, None
+        if self.stream.frames > 0 and len(entries) == self.stream.frames:
+            pairs = [(e.timestamp, e.is_keyframe) for e in entries]
+            entry_dts = np.sort(np.array([t for t, _ in pairs], dtype=np.int64))
+            entry_key_dts = np.sort(np.array([t for t, k in pairs if k], dtype=np.int64))
+
         # Frame times are resolved once, by the index thread, and published through
         # this future. Deriving them needs every frame's PTS, which is only known
         # when indexing completes -- so rather than hand out a provisional guess
@@ -353,8 +374,44 @@ class VideoHandler(BaseAudioVideo):
 
         self._index_ready = threading.Event()
         self._index_thread.start()
-        # decode first frame
+        if entry_dts is not None:
+            self._predict_pts_from_dts(entry_dts, entry_key_dts)
+        # decode first frame (already cached if the prediction decoded it)
         self.__getitem__(0)
+
+    def _predict_pts_from_dts(self, entry_dts: NDArray, entry_key_dts: NDArray) -> None:
+        """Predict every frame's PTS from the container's DTS list.
+
+        PTS = sorted DTS + a constant shift. The decoder emits frames in display
+        order, so frame 0 carries the smallest PTS and the shift is its PTS minus
+        the first DTS. Exact on every supported mp4/mov/avi sample checked with
+        _scripts/index_entries_survey.py; the index thread still checks it.
+        """
+        frame0 = next((f for f in self._frames() if f.pts is not None), None)
+        if frame0 is None:
+            return
+        self.current_frame = frame0
+        self.last_loaded_idx = 0
+        self._stream_pts = frame0.pts
+        self._buffer.put(0, frame0)
+
+        shift = frame0.pts - entry_dts[0]
+        with self._lock:
+            self._predicted_pts = entry_dts + shift
+            self._predicted_keyframe_pts = entry_key_dts + shift
+            # the index thread may already have committed frames before the shift was known
+            self._pts_from_dts = self._prediction_matches(0, self.all_pts[: self._i])
+
+    def _prediction_matches(self, start: int, chunk) -> bool:
+        """True if the demuxed PTS ``chunk`` at ``start`` match the prediction. Call under the lock."""
+        if np.array_equal(self._predicted_pts[start : start + len(chunk)], chunk):
+            return True
+        logger.warning(
+            "%s: frame timestamps differ from the container index; estimating "
+            "unindexed frames from the frame rate instead",
+            self.file_path.name,
+        )
+        return False
 
     @staticmethod
     def _ts_to_index(ts: float, time: NDArray) -> int:
@@ -482,6 +539,8 @@ class VideoHandler(BaseAudioVideo):
                     def update(extracted_pts):
                         chunk = process(extracted_pts)
                         with self._lock:
+                            if self._pts_from_dts:
+                                self._pts_from_dts = self._prediction_matches(self._i, chunk)
                             self.all_pts[self._i : self._i + len(chunk)] = chunk
                             self._i += len(chunk)
                         extracted_pts.clear()
@@ -583,6 +642,8 @@ class VideoHandler(BaseAudioVideo):
         if done:
             # the pts for this timestamp has been filled
             idx = np.searchsorted(self.all_pts[: self._i], pts, side="left")
+        elif self._pts_from_dts:
+            idx = int(np.searchsorted(self._predicted_pts, pts, side="left"))
         else:
             # keep going until at least two frames have been decoded by the thread
             while True:
@@ -620,6 +681,8 @@ class VideoHandler(BaseAudioVideo):
         with self._lock:
             if self._i > idx:
                 return self.all_pts[idx]
+            if self._pts_from_dts and idx < len(self._predicted_pts):
+                return int(self._predicted_pts[idx])
 
         # keep going until at least two frames have been decoded by the thread
         while True:
@@ -724,7 +787,11 @@ class VideoHandler(BaseAudioVideo):
         return self._get_by_pts(self._ts_to_pts(ts))
 
     def _indexed_frame_idx(self, ts: float) -> int | None:
-        """Index of the frame at or before ``ts``, or None if not indexed that far yet."""
+        """Index of the frame at or before ``ts``, or None if not indexed that far yet.
+
+        With ``_pts_from_dts`` the predicted PTS cover the whole video, so this
+        never returns None.
+        """
         if self._time_input is not None:
             if self._time_future.done():
                 exc = self._time_future.exception()
@@ -737,6 +804,9 @@ class VideoHandler(BaseAudioVideo):
         with self._lock:
             if self._i > 0 and self.all_pts[self._i - 1] > target_pts:
                 idx = np.searchsorted(self.all_pts[: self._i], target_pts, "right") - 1
+                return max(int(idx), 0)
+            if self._pts_from_dts:
+                idx = np.searchsorted(self._predicted_pts, target_pts, "right") - 1
                 return max(int(idx), 0)
         return None
 

@@ -740,10 +740,12 @@ def test_get_slice_past_index_estimates_without_waiting(video_info):
         tb = float(video.stream.time_base)
         times = np.sort(np.asarray(frame_pts_ref)) * tb
         # put the reader back in the state of a long file still being indexed:
-        # only the first 10 frames known, and time never resolves
+        # only the first 10 frames known, time never resolves, and no PTS
+        # predicted from the container index (the fallback this test is about)
         video._wait_for_all_pts()
         video._i = 10
         video._time_future = concurrent.futures.Future()
+        video._pts_from_dts = False
 
         with pytest.warns(UserWarning, match="not indexed up to the requested time"):
             sl = video.get_slice(times[50], times[60])
@@ -754,3 +756,55 @@ def test_get_slice_past_index_estimates_without_waiting(video_info):
         with warnings.catch_warnings():
             warnings.simplefilter("error")
             assert video.get_slice(times[3], times[7]) == slice(3, 7)
+
+
+@pytest.mark.parametrize("video_info", CODEC_EXTENSION_COMBOS, indirect=True)
+def test_pts_predicted_from_container_index(video_info):
+    """Where the container lists every frame's DTS, PTS are predicted exactly at init."""
+    _, frame_pts_ref, _, video_path = video_info
+    with VideoHandler(video_path) as video:
+        if not video._pts_from_dts:
+            # mkv, webm and mpg do not list every frame in their header
+            assert video_path.suffix in {".mkv", ".webm", ".mpg"}
+            return
+        np.testing.assert_array_equal(video._predicted_pts, np.sort(frame_pts_ref))
+
+
+@pytest.mark.parametrize("video_info", CODEC_EXTENSION_COMBOS, indirect=True)
+def test_streaming_read_uses_predicted_pts(video_info):
+    """Reading far ahead of the index thread: right frames, few seeks, no warning.
+
+    Puts the reader in the state of a long file being streamed: only 10 frames
+    demuxed, keyframe thread not finished, time unresolved.
+    """
+    frame_array, frame_pts_ref, _, video_path = video_info
+    with VideoHandler(video_path) as video:
+        if not video._pts_from_dts:
+            pytest.skip("container does not list every frame's DTS")
+        video._wait_for_index()
+        video._i = 10
+        video._pts_keyframe_ready.clear()
+        video._keyframe_pts = video._keyframe_pts[:1]
+        video._time_future = concurrent.futures.Future()
+
+        seeks = []
+        original_seek = video._seek
+
+        def counting_seek(pts):
+            seeks.append(pts)
+            original_seek(pts)
+
+        video._seek = counting_seek
+
+        frames = video[50:53]
+        np.testing.assert_array_equal(
+            np.stack([f.to_ndarray() for f in frames]), frame_array[50:53]
+        )
+        # __getitem__ and _decode_multiple each seek once at the start; nothing per frame
+        assert len(seeks) <= 2, seeks
+
+        tb = float(video.stream.time_base)
+        times = np.sort(np.asarray(frame_pts_ref)) * tb
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            assert video.get_slice(times[60], times[70]) == slice(60, 70)
