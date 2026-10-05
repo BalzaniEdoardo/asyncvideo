@@ -1285,24 +1285,27 @@ class VideoHandler(BaseAudioVideo):
         time_is_int = isinstance(idx, int)
 
         if isinstance(idx, slice):
-            # Resolve frame count once — fast path if already known, otherwise waits.
-            n_frames = self._n_frames if self._n_frames is not None else self.shape[0]
 
             # Fill in missing slice components
             start = idx.start or 0
-            if start >= n_frames:
+            if self._n_frames is not None and start >= self._n_frames:
                 if self.pixel_format is not None:
                     return np.empty((0, *self._frame_shape), dtype=np.uint8)
                 else:
                     return []
-            stop = idx.stop if idx.stop is not None else n_frames
-            step = idx.step if idx.step is not None else 1
 
-            # convert negative vals
-            start = start if start >= 0 else start + n_frames
-            start = max(0, min(start, n_frames))
-            stop = stop + n_frames if stop < 0 else stop
-            stop = max(0, min(stop, n_frames))
+            stop = idx.stop
+            if stop is None or stop < 0 or start < 0 or self._n_frames is not None:
+                # get the final frame, wait if needed
+                n_frames = self._n_frames if self._n_frames is not None else self.shape[0]
+                start = start if start >= 0 else start + n_frames
+                stop = stop if stop >= 0 else stop + n_frames
+                start = min(start, n_frames)
+                stop = min(stop, n_frames)
+
+            step = idx.step if idx.step is not None else 1
+            start = max(0, start)
+            stop = max(0, stop)
 
             # revert slice if negative step
             revert = step < 0
@@ -1331,8 +1334,9 @@ class VideoHandler(BaseAudioVideo):
         # Default case: single index
         # TODO Check borders
         idx_start = idx if not hasattr(idx, "start") else idx.start
-        n_frames = self._n_frames if self._n_frames is not None else self.shape[0]
-        idx_start = idx_start if idx_start >= 0 else n_frames + idx_start
+        if idx_start < 0:
+            n_frames = self._n_frames if self._n_frames is not None else self.shape[0]
+            idx_start += n_frames
         frame = self._get_by_index(idx_start)
         # handle slice requesting a single frame:
         # for arrays add 1 dimension (1, pixel, pixel)
