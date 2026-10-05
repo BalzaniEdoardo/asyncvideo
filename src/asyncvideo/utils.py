@@ -123,6 +123,6 @@ def create_buffers(
 
     else:
         raise ValueError(
-            f"only rgb24, yuv420p, yuvj420p and yuv444p colorspaces are currently supported, "
+            f"only {list(Colorspace)} are currently supported, "
             f"provided video with colorspace: {colorspace}"
         )
