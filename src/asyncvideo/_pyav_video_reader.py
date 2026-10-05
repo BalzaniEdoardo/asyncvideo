@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import abc
 import logging
+import math
 import pathlib
 import threading
 import time
@@ -471,7 +472,7 @@ class VideoHandler(BaseAudioVideo):
                 if n_frames > 0:
                     # preallocate indices
                     with self._lock:
-                        self.all_pts = np.empty(n_frames, dtype=np.int64)
+                        self.all_pts = np.zeros(n_frames, dtype=np.int64)
 
                     def update(extracted_pts):
                         chunk = process(extracted_pts)
@@ -524,35 +525,36 @@ class VideoHandler(BaseAudioVideo):
         """
         if self._time_future.done():
             return
-        try:
-            if self._time_provided is not None:
-                n_times = len(self._time_input)
-                n_frames = self._i
-                valid = n_times == n_frames
-                if valid:
-                    self._time_future.set_result(self._time_input)
-                else:
-                    self._time_future.set_exception(
-                        ValueError(
-                            f"the provided time array has length {n_times}, but the video has "
-                            f"{n_frames} frames; pass one timestamp per frame"
-                        )
-                    )
-                return
 
-            # Real frame times from the stream's own presentation timestamps.
-            # all_pts is in stream time_base units and sorted into display order
-            # by the indexer, so scaling it gives absolute, monotonic seconds --
-            # accurate for variable frame rate video, unlike a uniform grid.
-            pts = np.asarray(self.all_pts[: self._i], dtype=np.int64)
-            if len(pts) != self._i:
-                raise ValueError(
-                    f"indexing found {self._i} frames but only {len(pts)} "
-                    f"presentation timestamps"
+        if self._time_provided:
+            n_times = len(self._time_input)
+            n_frames = self._i
+            valid = n_times == n_frames
+            if valid:
+                self._time_future.set_result(self._time_input)
+            else:
+                self._time_future.set_exception(
+                    ValueError(
+                        f"the provided time array has length {n_times}, but the video has "
+                        f"{n_frames} frames; pass one timestamp per frame"
+                    )
                 )
-            self._time_future.set_result(pts * float(self.stream.time_base))
-        except BaseException as exc:  # noqa: BLE001 - must not leave callers hanging
-            self._time_future.set_exception(exc)
+            return
+
+        # Real frame times from the stream's own presentation timestamps.
+        # all_pts is in stream time_base units and sorted into display order
+        # by the indexer, so scaling it gives absolute, monotonic seconds --
+        # accurate for variable frame rate video, unlike a uniform grid.
+        pts = np.asarray(self.all_pts[: self._i], dtype=np.int64)
+        if len(pts) != self._i:
+            self._time_future.set_exception(
+                ValueError(
+                    f"Indexing found {self._i} frames but only {len(pts)} "
+                    f"presentation timestamps."
+                )
+            )
+            return
+        self._time_future.set_result(pts * float(self.stream.time_base))
 
     def _get_frame_idx(self, pts: int) -> tuple[int, bool]:
         """
@@ -720,8 +722,56 @@ class VideoHandler(BaseAudioVideo):
           previously decoded one, the cached frame is returned.
         """
         if self._time_input is not None:
-            self._get_by_index(self._ts_to_index(ts, self._time_input))
+            if self._time_future.done():
+                exc = self._time_future.exception()
+                if exc is not None:
+                    raise exc
+            return self._get_by_index(self._ts_to_index(ts, self._time_input))
+        elif not self._time_future.done():
+            tb = float(self.stream.time_base)
+            target_pts = ts / tb
+            # make sure that (N-1).99999999 is not floored to N-1
+            while (target_pts + 1) * tb <= ts:
+                target_pts += 1
+            while target_pts * tb > ts:
+                target_pts -= 1
+            with self._lock:
+                if self._i > 0 and self.all_pts[self._i - 1] > target_pts:
+                    idx = np.searchsorted(self.all_pts[: self._i], target_pts, "right") - 1
+                    idx = max(idx, 0)
+                else:
+                    idx = None
+            if idx is not None:
+                return self._get_by_index(idx)
+            return self._get_by_pts(target_pts)
         return self._get_by_index(self._ts_to_index(ts, self.time))
+
+    def _get_by_pts(self, pts):
+        with self._lock:
+            # all_pts has at least one entry (because getitem is called once at init)
+            # and waits for the first entry
+            pts = max(self.all_pts[0], pts)
+
+        if getattr(self.current_frame, "pts", None) == pts:
+            return (
+                self.current_frame.to_ndarray(format=self.pixel_format)
+                if self.pixel_format is not None
+                else self.current_frame
+            )
+
+        if self._at_eof or self._stream_pts is None or self._need_seek_call(self._stream_pts, pts):
+            self._seek(pts)
+        _, frame = self._decode_and_check_frames(False, pts, 0)
+        if frame is not None:
+            self.current_frame = frame
+            self._stream_pts = frame.pts
+        self.last_loaded_idx = None
+        return (
+            self.current_frame.to_ndarray(format=self.pixel_format)
+            if self.pixel_format is not None
+            else self.current_frame
+        )
+
 
     def _get_by_index(self, idx: int):
         """
@@ -1083,6 +1133,17 @@ class VideoHandler(BaseAudioVideo):
             If a ``time`` array was given whose length does not match the number
             of frames actually found in the video.
         """
+        time_indexed = self._time_future.done()
+        time_provided = self._time_input is not None
+        if time_provided and time_indexed:
+            return self._time_future.result()
+        elif time_provided:
+            return self._time_input
+        elif self._n_frames is not None:
+            # return an estimate
+            time_estimate = np.arange(self._n_frames, dtype=float) / float(self._n_frames * self.stream.time_base)
+            return time_estimate
+        # wait... no info allow time estimation
         return self._time_future.result()
 
     def _wait_for_all_pts(self, timeout=None):
