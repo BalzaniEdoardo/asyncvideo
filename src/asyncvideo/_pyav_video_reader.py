@@ -718,24 +718,27 @@ class VideoHandler(BaseAudioVideo):
         - Uses an internal cache: if the requested frame index matches the
           previously decoded one, the cached frame is returned.
         """
+        idx = self._indexed_frame_idx(ts)
+        if idx is not None:
+            return self._get_by_index(idx)
+        return self._get_by_pts(self._ts_to_pts(ts))
+
+    def _indexed_frame_idx(self, ts: float) -> int | None:
+        """Index of the frame at or before ``ts``, or None if not indexed that far yet."""
         if self._time_input is not None:
             if self._time_future.done():
                 exc = self._time_future.exception()
                 if exc is not None:
                     raise exc
-            return self._get_by_index(self._ts_to_index(ts, self._time_input))
-        elif not self._time_future.done():
-            target_pts = self._ts_to_pts(ts)
-            with self._lock:
-                if self._i > 0 and self.all_pts[self._i - 1] > target_pts:
-                    idx = np.searchsorted(self.all_pts[: self._i], target_pts, "right") - 1
-                    idx = max(idx, 0)
-                else:
-                    idx = None
-            if idx is not None:
-                return self._get_by_index(idx)
-            return self._get_by_pts(target_pts)
-        return self._get_by_index(self._ts_to_index(ts, self.time))
+            return self._ts_to_index(ts, self._time_input)
+        if self._time_future.done():
+            return self._ts_to_index(ts, self._time_future.result())
+        target_pts = self._ts_to_pts(ts)
+        with self._lock:
+            if self._i > 0 and self.all_pts[self._i - 1] > target_pts:
+                idx = np.searchsorted(self.all_pts[: self._i], target_pts, "right") - 1
+                return max(int(idx), 0)
+        return None
 
     def _get_by_pts(self, pts):
         with self._lock:
@@ -1140,12 +1143,21 @@ class VideoHandler(BaseAudioVideo):
 
     def get_slice(self, start: float, end: float | None = None):
         # TODO check start and end are sorted
-        start = self._ts_to_index(start, self.time)
-        if end:
-            end = self._ts_to_index(end, self.time)
-            return slice(start, end)
-        else:
-            return slice(start, start + 1)
+        times = [start] if end is None else [start, end]
+        indices = [self._indexed_frame_idx(ts) for ts in times]
+        if None in indices:
+            warnings.warn(
+                "the video is not indexed up to the requested time yet; the slice is "
+                "estimated from the average frame interval and may be off by a few frames",
+                stacklevel=2,
+            )
+            indices = [
+                self._get_frame_idx(self._ts_to_pts(ts)) if idx is None else idx
+                for ts, idx in zip(times, indices)
+            ]
+        if end is None:
+            return slice(indices[0], indices[0] + 1)
+        return slice(indices[0], indices[1])
 
     def _append_frame(self, frames, idx, frame):
         if self.pixel_format is not None:

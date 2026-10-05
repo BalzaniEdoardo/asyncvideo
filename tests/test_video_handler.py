@@ -1,6 +1,7 @@
 import asyncio
 import concurrent.futures
 import pathlib
+import warnings
 
 import av
 import numpy as np
@@ -457,7 +458,7 @@ def test_seek_clears_eof_flag(video_info):
     """
     frame_array, _, _, video_path = video_info
     with VideoHandler(video_path, time=np.arange(100)) as video:
-        target_pts, _use_time = video._get_target_frame_pts(0)
+        target_pts = video._get_target_frame_pts(0)
 
         video._at_eof = True
         video._seek(target_pts)
@@ -473,8 +474,8 @@ def test_stale_eof_flag_still_reads_correctly(video_info):
 
     Note this does not reproduce the EOF bug -- the decoder here is healthy and
     only the flag is set, so it passes with or without the recovery logic. What
-    it pins is that the extra seek the flag triggers is harmless: the read still
-    lands on the right frame rather than on the keyframe before it.
+    it checks is that the extra seek the flag triggers is harmless: the read
+    still returns the right frame rather than the keyframe before it.
     """
     frame_array, _, _, video_path = video_info
     with VideoHandler(video_path, time=np.arange(100)) as video:
@@ -684,3 +685,72 @@ def test_getitem_decoupled_current_frame_and_pts_decoding_via_decode_multiple(
         frames = video_obj[12:14]
         frames = np.stack([f.to_ndarray() for f in frames])
         np.testing.assert_array_equal(frame_array[12:14], frames)
+
+
+WEBM_COMBOS = [
+    pytest.param(("vp9", "webm"), id="vp9_webm"),
+    pytest.param(("av1", "webm"), id="av1_webm"),
+]
+
+
+@pytest.mark.parametrize("video_info", WEBM_COMBOS, indirect=True)
+@pytest.mark.parametrize("pixel_format", [None, "yuv420p"])
+@pytest.mark.parametrize(
+    "start, stop, step, expected",
+    [
+        (95, 110, 1, list(range(95, 100))),  # runs past the last frame
+        (90, 110, 3, [90, 93, 96, 99]),  # stepped, last frame hit exactly
+        (91, 110, 3, [91, 94, 97, 99]),  # stepped, last target past the end
+    ],
+)
+def test_slice_past_end_without_frame_count(
+    video_info, pixel_format, start, stop, step, expected
+):
+    """A slice past the end stops at the end of the stream, without the frame count.
+
+    webm declares no frame count, so clamping ``stop`` to it would mean waiting
+    for the indexer to demux the whole file. The slice must instead decode until
+    the stream ends and return each real frame once.
+    """
+    frame_array, _, _, video_path = video_info
+    with VideoHandler(video_path, pixel_format=pixel_format) as video:
+        # The 100-frame fixture indexes almost instantly, so put the reader back
+        # in the state it is in while a long file is still being indexed: count
+        # unknown, and any wait on the indexer is a failure.
+        video._wait_for_all_pts()
+        video._n_frames = None
+
+        def fail(timeout=None):
+            raise AssertionError("slice waited on the indexer")
+
+        video._wait_for_all_pts = fail
+
+        frames = video[start:stop:step]
+
+        if pixel_format is None:
+            frames = np.stack([f.to_ndarray() for f in frames])
+        np.testing.assert_array_equal(frames, frame_array[expected])
+
+
+@pytest.mark.parametrize("video_info", CODEC_EXTENSION_COMBOS, indirect=True)
+def test_get_slice_past_index_estimates_without_waiting(video_info):
+    """Past the indexed part, get_slice estimates the slice and warns instead of waiting."""
+    _, frame_pts_ref, _, video_path = video_info
+    with VideoHandler(video_path) as video:
+        tb = float(video.stream.time_base)
+        times = np.sort(np.asarray(frame_pts_ref)) * tb
+        # put the reader back in the state of a long file still being indexed:
+        # only the first 10 frames known, and time never resolves
+        video._wait_for_all_pts()
+        video._i = 10
+        video._time_future = concurrent.futures.Future()
+
+        with pytest.warns(UserWarning, match="not indexed up to the requested time"):
+            sl = video.get_slice(times[50], times[60])
+        # constant frame rate fixtures: the estimate is exact
+        assert sl == slice(50, 60)
+
+        # inside the indexed part: exact, no warning
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            assert video.get_slice(times[3], times[7]) == slice(3, 7)
