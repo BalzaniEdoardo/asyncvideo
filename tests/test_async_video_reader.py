@@ -510,9 +510,10 @@ def _write_clip(path, pix_fmt, n_frames=20, height=48, width=64):
 def test_yuv_formats_match_pyav_planes(tmp_path, pix_fmt):
     """Each supported planar YUV format must come back plane-for-plane intact.
 
-    yuvj420p is storage-identical to yuv420p (only the value range differs) and
-    is normalized to it. yuv444p keeps chroma at full resolution, so its U and V
-    planes must have the luma shape rather than half of it in each direction.
+    yuvj420p is storage-identical to yuv420p (only the value range differs) but
+    keeps its own colorspace, so RGB conversion uses the full range. yuv444p
+    keeps chroma at full resolution, so its U and V planes must have the luma
+    shape rather than half of it in each direction.
     """
     path = tmp_path / f"{pix_fmt}.mp4"
     _write_clip(path, pix_fmt)
@@ -527,7 +528,7 @@ def test_yuv_formats_match_pyav_planes(tmp_path, pix_fmt):
 
     r = AsyncVideoReader(path)
     try:
-        assert r.colorspace == ("yuv420p" if pix_fmt == "yuvj420p" else pix_fmt)
+        assert r.colorspace == pix_fmt
         y, u, v = r[(10,)].result(timeout=RESULT_TIMEOUT)
     finally:
         r.shutdown()
@@ -539,6 +540,27 @@ def test_yuv_formats_match_pyav_planes(tmp_path, pix_fmt):
     assert u.shape == v.shape
     for got, want in zip((y, u, v), expected[10]):
         np.testing.assert_array_equal(got[0], want)
+
+
+@pytest.mark.parametrize("pix_fmt", ["yuv420p", "yuvj420p"])
+def test_packed_yuv_formats_match_pyav(tmp_path, pix_fmt):
+    """Both 4:2:0 formats share the packed layout, and convert with their own range."""
+    path = tmp_path / f"{pix_fmt}.mp4"
+    _write_clip(path, pix_fmt)
+
+    with av.open(str(path)) as container:
+        frames = list(container.decode(video=0))
+        expected = frames[10].to_ndarray()
+        expected_rgb = frames[10].to_ndarray(format="rgb24")
+
+    r = AsyncVideoReader(path, yuv_packed=True)
+    try:
+        assert r.colorspace == pix_fmt
+        frame = r[(10,)].result(timeout=RESULT_TIMEOUT)
+        np.testing.assert_array_equal(frame[0], expected)
+        np.testing.assert_array_equal(r.to_rgb(frame)[0], expected_rgb)
+    finally:
+        r.shutdown()
 
 
 def test_packed_yuv_matches_reference(video_path, reference):

@@ -19,7 +19,14 @@ SharedMemYUV: TypeAlias = tuple[SharedMemory, SharedMemory, SharedMemory]
 class Colorspace(StrEnum):
     rgb24 = "rgb24"
     yuv420p = "yuv420p"
+    yuvj420p = "yuvj420p"
     yuv444p = "yuv444p"
+
+
+# planar formats returned as a (Y, U, V) tuple of planes
+YUV_COLORSPACES = (Colorspace.yuv420p, Colorspace.yuvj420p, Colorspace.yuv444p)
+# formats with a packed (H * 3 // 2, W) layout, see ``yuv_packed``
+PACKABLE_COLORSPACES = (Colorspace.yuv420p, Colorspace.yuvj420p)
 
 
 class ReaderError(IntEnum):
@@ -46,13 +53,10 @@ def create_shared_memory(
     frame: av.VideoFrame, n_frames: int = 1, yuv_packed: bool = False
 ) -> SharedMemYUV | SharedMemRGB:
     colorspace = frame.format.name
-    # yuvj420p (full-range JPEG) is storage-identical to yuv420p
-    if colorspace == "yuvj420p":
-        colorspace = "yuv420p"
 
     rows, cols = frame.height, frame.width
 
-    if colorspace in (Colorspace.yuv420p, Colorspace.yuv444p):
+    if colorspace in YUV_COLORSPACES:
         if yuv_packed:
             # packed shape
             rows = rows * 3 // 2
@@ -75,7 +79,7 @@ def create_shared_memory(
 
     else:
         raise ValueError(
-            f"only rgb24, yuv420p and yuv444p colorspaces are currently supported, "
+            f"only rgb24, yuv420p, yuvj420p and yuv444p colorspaces are currently supported, "
             f"provided video with colorspace: {colorspace}"
         )
 
@@ -88,7 +92,7 @@ def create_buffers(
     n_frames: int = 1,
     yuv_packed: bool = False,
 ) -> UInt8Array | TupleYUV:
-    if colorspace in (Colorspace.yuv420p, Colorspace.yuv444p):
+    if colorspace in YUV_COLORSPACES:
         if yuv_packed:
             buffer = np.ndarray(
                 shape=(n_frames, shape_frame[0] * 3 // 2, shape_frame[1]),
@@ -119,6 +123,6 @@ def create_buffers(
 
     else:
         raise ValueError(
-            f"only rgb24, yuv420p and yuv444p colorspaces are currently supported, "
+            f"only rgb24, yuv420p, yuvj420p and yuv444p colorspaces are currently supported, "
             f"provided video with colorspace: {colorspace}"
         )

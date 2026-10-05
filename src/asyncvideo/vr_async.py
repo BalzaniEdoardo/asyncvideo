@@ -19,6 +19,8 @@ from ._pyav_video_reader import VideoHandler
 from ._vr_process import _reader_process
 from .convert import to_rgb
 from .utils import (
+    PACKABLE_COLORSPACES,
+    YUV_COLORSPACES,
     Colorspace,
     FutureArray,
     ReaderError,
@@ -220,11 +222,7 @@ class AsyncVideoReader:
         self._shape_frame = frame0.height, frame0.width
         n_frames = vr.shape[0]
 
-        frame_format = frame0.format.name
-        # yuvj420p (full-range JPEG) is storage-identical to yuv420p (limited-range)
-        if frame_format == "yuvj420p":
-            frame_format = "yuv420p"
-        colorspace = Colorspace(frame_format)
+        colorspace = Colorspace(frame0.format.name)
 
         self._colorspace = colorspace
         frame0_numpy = frame0.to_ndarray()
@@ -234,7 +232,7 @@ class AsyncVideoReader:
             self._shape = (n_frames, *self._shape_frame, 3)
             self._shape_chroma = None
 
-        elif self.colorspace in (Colorspace.yuv420p, Colorspace.yuv444p):
+        elif self.colorspace in YUV_COLORSPACES:
             self._shape = (n_frames, *self._shape_frame)
             # full resolution for yuv444p, half in each direction for yuv420p
             self._shape_chroma = (
@@ -245,7 +243,7 @@ class AsyncVideoReader:
         n_frames = 1
 
         # the packed layout is a yuv420p one, there is nothing to pack otherwise
-        self._yuv_packed = yuv_packed and self.colorspace == Colorspace.yuv420p
+        self._yuv_packed = yuv_packed and self.colorspace in PACKABLE_COLORSPACES
 
         self._shared_mems = create_shared_memory(
             frame0, n_frames=n_frames, yuv_packed=self._yuv_packed
@@ -461,10 +459,7 @@ class AsyncVideoReader:
                         if self.colorspace == Colorspace.rgb24 or self._yuv_packed:
                             future.set_result(self._buffer.copy())
 
-                        elif self.colorspace in (
-                            Colorspace.yuv420p,
-                            Colorspace.yuv444p,
-                        ):
+                        elif self.colorspace in YUV_COLORSPACES:
                             future.set_result(
                                 (
                                     self._buffer[0].copy(),
