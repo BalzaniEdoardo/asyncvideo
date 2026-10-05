@@ -571,19 +571,20 @@ class VideoHandler(BaseAudioVideo):
             # the pts for this timestamp has been filled
             idx = np.searchsorted(self.all_pts[: self._i], pts, side="left")
         else:
-            # run until future is filled or at least 1 frame is demuxed
-            # demux should be fast
+            # keep going until at least two frames have been decoded by the thread
             while True:
                 with self._lock:
-                    if self._i > 0 or self._time_future.done():
+                    if self._i > 1 or self._time_future.done():
                         if self._i == 0:
                             raise ValueError("No presentation time stamp found! The video may have 0 frames.")
                         break
                 time.sleep(0.001)
-            # use time base to estimate the index
-            time_base = float(self.stream.time_base)
+            # use recent history to get the step estimate
             with self._lock:
-                idx = int(round((pts - self.all_pts[0]) / time_base))
+                # Linear extrapolation from available pts (use last 10 steps for an estimate)
+                start, stop = max(self._i - 10, 0), self._i
+                avg_step = np.mean(np.diff(self.all_pts[start:stop]))
+                idx = int(round((pts - self.all_pts[0]) / avg_step))
         return idx
 
     def _get_target_frame_pts(self, idx: int) -> int:
@@ -874,8 +875,9 @@ class VideoHandler(BaseAudioVideo):
             # is what the decoder must hand back first. Insisting on it is what
             # makes the retry worth doing: the same containers that seek late also
             # mislabel timestamps afterwards, handing back a frame carrying the
-            # target's pts but decoded from the wrong reference. Landing anywhere
-            # else means this restart point is unusable, not that the frame is.
+            # target's pts but decoded from the wrong reference. If the decoder
+            # starts on any other frame, this restart point is unusable, but the
+            # target frame may still be reachable from an earlier one.
             frame, missed = self._scan_once(
                 target_pts, idx, expect_keyframe_pts=rewind_pts + 1
             )
@@ -1154,8 +1156,10 @@ class VideoHandler(BaseAudioVideo):
         idx_end: int,
         step: int = 1,
     ) -> tuple[list[av.VideoFrame | NDArray], av.VideoFrame]:
-        effective_end = min(idx_end, self.shape[0])
-        indices = np.arange(idx_start, effective_end, step)
+        # Not clamped to the frame count: when the container does not declare
+        # one, waiting for it would mean demuxing the whole file. The end of the
+        # stream stops the loop instead, and the result is trimmed below.
+        indices = np.arange(idx_start, idx_end, step)
         num_frames = len(indices)
 
         if self.pixel_format is not None:
@@ -1174,10 +1178,13 @@ class VideoHandler(BaseAudioVideo):
 
         preceding_frame = self.current_frame
         last_frame = self.current_frame
+        # identity of the frame most recently added to the output, so the end of
+        # the stream can tell whether the last decoded frame was already used
+        last_appended = None
         # The first target is seeked to unconditionally, as before; from then on
         # the shared iterator carries the position (and any queued frames)
         # forward, including past the end of this call.
-        seeked = False
+        seeked_for = None
 
         while collected < num_frames:
             # check buffer first
@@ -1186,17 +1193,20 @@ class VideoHandler(BaseAudioVideo):
                 self.current_frame = cached
                 self.last_loaded_idx = indices[collected]
                 self._append_frame(frames, collected, cached)
-                preceding_frame = cached
-                last_frame = cached
+                preceding_frame = last_frame = last_appended = cached
                 collected += 1
                 continue
 
             target_pts = self._get_target_frame_pts(indices[collected])
 
             # Seek when the target is behind us or past a nearer keyframe.
-            if not seeked or self._need_seek_call(self._stream_pts, target_pts):
+            # At most once per target: repeating the same seek lands in the same place.
+            if seeked_for is None or (
+                seeked_for != indices[collected]
+                and self._need_seek_call(self._stream_pts, target_pts)
+            ):
                 self._seek(target_pts)
-                seeked = True
+                seeked_for = indices[collected]
                 # Whatever was decoded before the seek describes the position we
                 # just left, so it is not a candidate answer for anything after
                 # it -- and its absence is what marks a seek that landed late.
@@ -1211,9 +1221,18 @@ class VideoHandler(BaseAudioVideo):
                 self._decoder = None
                 frame = None
 
-            passed_target = frame is not None and (
-                frame.pts > target_pts
-            )
+            passed_target = frame is not None and frame.pts > target_pts
+
+            # The stream ran out after this pass had already decoded something,
+            # so the read position was right and this is the real end of the
+            # video. The last frame decoded answers this target unless it was
+            # already used for an earlier one; either way nothing follows it.
+            if frame is None and preceding_frame is not None:
+                if preceding_frame is not last_appended:
+                    self._append_frame(frames, collected, preceding_frame)
+                    collected += 1
+                    last_frame = last_appended = preceding_frame
+                break
 
             # Same late seek the single-frame path handles: either the stream ran
             # out before the target, or the first frame after the seek was already
@@ -1226,7 +1245,7 @@ class VideoHandler(BaseAudioVideo):
                     break
                 self._append_frame(frames, collected, frame)
                 collected += 1
-                last_frame = preceding_frame = frame
+                last_frame = preceding_frame = last_appended = frame
                 continue
 
             self._publish_decoded(frame)
@@ -1237,13 +1256,18 @@ class VideoHandler(BaseAudioVideo):
                 frame = preceding_frame
                 self._append_frame(frames, collected, frame)
                 collected += 1
+                last_appended = frame
             elif found_current:
                 self._append_frame(frames, collected, frame)
                 collected += 1
+                last_appended = frame
 
             last_frame = frame
             preceding_frame = frame
 
+        # preallocated for the requested range; the stream may have ended sooner
+        if self.pixel_format is not None:
+            frames = frames[:collected]
         return frames, last_frame
 
     def __getitem__(
@@ -1299,6 +1323,8 @@ class VideoHandler(BaseAudioVideo):
                 # get the final frame, wait if needed
                 n_frames = self._n_frames if self._n_frames is not None else self.shape[0]
                 start = start if start >= 0 else start + n_frames
+                if stop is None:
+                    stop = n_frames
                 stop = stop if stop >= 0 else stop + n_frames
                 start = min(start, n_frames)
                 stop = min(stop, n_frames)
