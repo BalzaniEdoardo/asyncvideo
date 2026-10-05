@@ -8,9 +8,11 @@ from __future__ import annotations
 
 import abc
 import logging
+import math
 import pathlib
 import threading
 import time
+import warnings
 from collections import deque
 from concurrent.futures import Future
 from typing import Literal
@@ -380,6 +382,17 @@ class VideoHandler(BaseAudioVideo):
         idx = np.searchsorted(time, ts, side="right") - 1
         return np.clip(idx, 0, len(time) - 1)
 
+    def _ts_to_pts(self, ts: float) -> int:
+        """Largest pts with ``pts * time_base <= ts``, the same product ``time`` uses."""
+        tb = float(self.stream.time_base)
+        pts = math.floor(ts / tb)
+        # (p * tb) / tb == p does not hold in floating point, so the floor can be one off
+        while (pts + 1) * tb <= ts:
+            pts += 1
+        while pts * tb > ts:
+            pts -= 1
+        return pts
+
     def _extract_keyframe_times_and_points(
         self, video_path: str | pathlib.Path, stream_index: int = 0, first_only=False
     ) -> tuple[NDArray, NDArray] | None:
@@ -712,13 +725,7 @@ class VideoHandler(BaseAudioVideo):
                     raise exc
             return self._get_by_index(self._ts_to_index(ts, self._time_input))
         elif not self._time_future.done():
-            tb = float(self.stream.time_base)
-            target_pts = ts / tb
-            # make sure that (N-1).99999999 is not floored to N-1
-            while (target_pts + 1) * tb <= ts:
-                target_pts += 1
-            while target_pts * tb > ts:
-                target_pts -= 1
+            target_pts = self._ts_to_pts(ts)
             with self._lock:
                 if self._i > 0 and self.all_pts[self._i - 1] > target_pts:
                     idx = np.searchsorted(self.all_pts[: self._i], target_pts, "right") - 1
@@ -1115,10 +1122,6 @@ class VideoHandler(BaseAudioVideo):
             return self._time_future.result()
         elif time_provided:
             return self._time_input
-        elif self._n_frames is not None:
-            # return an estimate
-            time_estimate = np.arange(self._n_frames, dtype=float) / float(self._n_frames * self.stream.time_base)
-            return time_estimate
         # wait... no info allow time estimation
         return self._time_future.result()
 
