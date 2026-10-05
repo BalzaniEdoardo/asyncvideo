@@ -10,7 +10,14 @@ import av
 import numpy as np
 
 from ._pyav_video_reader import VideoHandler, pyav_trim_plane
-from .utils import Colorspace, ReaderError, SharedMemRGB, SharedMemYUV, create_buffers
+from .utils import (
+    YUV_COLORSPACES,
+    Colorspace,
+    ReaderError,
+    SharedMemRGB,
+    SharedMemYUV,
+    create_buffers,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -132,18 +139,12 @@ def _reader_process(
                         continue
 
                     frame_format = frame.format.name
-                    # yuvj420p (full-range JPEG) is storage-identical to yuv420p
-                    if frame_format == "yuvj420p":
-                        frame_format = "yuv420p"
                     if frame_format == "rgb24":
                         np.copyto(
                             buffer, pyav_trim_plane(frame.planes[0]), casting="no"
                         )
 
-                    elif frame_format in (
-                        Colorspace.yuv420p,
-                        Colorspace.yuv444p,
-                    ):
+                    elif frame_format in YUV_COLORSPACES:
                         if yuv_packed:
                             np.copyto(buffer, frame.to_ndarray(), casting="no")
                         else:

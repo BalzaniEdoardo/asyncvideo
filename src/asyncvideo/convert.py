@@ -17,15 +17,16 @@ from numpy.typing import NDArray
 
 __all__ = ["to_rgb"]
 
-PixelFormat = Literal["rgb24", "yuv420p", "yuv444p"]
+PixelFormat = Literal["rgb24", "yuv420p", "yuvj420p", "yuv444p"]
 
 RGB24: PixelFormat = "rgb24"
 YUV420P: PixelFormat = "yuv420p"
+YUVJ420P: PixelFormat = "yuvj420p"
 YUV444P: PixelFormat = "yuv444p"
 
 # per-format number of dimensions of a *single* frame, used to tell a single
 # frame from a stack of frames
-_SINGLE_NDIM: dict[PixelFormat, int] = {RGB24: 3, YUV420P: 2, YUV444P: 3}
+_SINGLE_NDIM: dict[PixelFormat, int] = {RGB24: 3, YUV420P: 2, YUVJ420P: 2, YUV444P: 3}
 
 
 def _is_rgb(arr: NDArray) -> bool:
