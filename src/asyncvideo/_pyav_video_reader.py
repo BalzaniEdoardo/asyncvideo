@@ -317,7 +317,12 @@ class VideoHandler(BaseAudioVideo):
         # ``_resolve_time`` once the indexer has counted the frames, which stays
         # the authoritative check: a header count can disagree with reality.
         if self._time_provided and self.stream.frames > 0:
-            self._check_time_length(len(self._time_input), self.stream.frames)
+            n_times = len(self._time_input)
+            if n_times != self.stream.frames:
+                raise ValueError(
+                    f"the provided time array has length {n_times}, but the video has "
+                    f"{self.stream.frames} frames; pass one timestamp per frame"
+                )
 
         # initialize index for last decoded frame
         # if sampling of other signals (LFP) is much denser, multiple times the frame
@@ -508,16 +513,7 @@ class VideoHandler(BaseAudioVideo):
             self._n_frames = self._i
             self._resolve_time()
             self._index_ready.set()
-
-    def _check_time_length(self, n_times: int, n_frames: int) -> None:
-        """Raise if a provided ``time`` array does not have one entry per frame."""
-        if n_times != n_frames:
-            self._time_future.set_exception(
-                ValueError(
-                    f"the provided time array has length {n_times}, but the video has "
-                    f"{n_frames} frames; pass one timestamp per frame"
-                )
-            )
+            
 
     def _resolve_time(self):
         """Publish the frame times through ``_time_future``.
@@ -529,9 +525,19 @@ class VideoHandler(BaseAudioVideo):
         if self._time_future.done():
             return
         try:
-            if self._time_provided:
-                self._check_time_length(len(self._time_input), self._i)
-                self._time_future.set_result(self._time_input)
+            if self._time_provided is not None:
+                n_times = len(self._time_input)
+                n_frames = self._i
+                valid = n_times == n_frames
+                if valid:
+                    self._time_future.set_result(self._time_input)
+                else:
+                    self._time_future.set_exception(
+                        ValueError(
+                            f"the provided time array has length {n_times}, but the video has "
+                            f"{n_frames} frames; pass one timestamp per frame"
+                        )
+                    )
                 return
 
             # Real frame times from the stream's own presentation timestamps.
