@@ -509,13 +509,14 @@ class VideoHandler(BaseAudioVideo):
             self._resolve_time()
             self._index_ready.set()
 
-    @staticmethod
-    def _check_time_length(n_times: int, n_frames: int) -> None:
+    def _check_time_length(self, n_times: int, n_frames: int) -> None:
         """Raise if a provided ``time`` array does not have one entry per frame."""
         if n_times != n_frames:
-            raise ValueError(
-                f"the provided time array has length {n_times}, but the video has "
-                f"{n_frames} frames; pass one timestamp per frame"
+            self._time_future.set_exception(
+                ValueError(
+                    f"the provided time array has length {n_times}, but the video has "
+                    f"{n_frames} frames; pass one timestamp per frame"
+                )
             )
 
     def _resolve_time(self):
@@ -712,6 +713,8 @@ class VideoHandler(BaseAudioVideo):
         - Uses an internal cache: if the requested frame index matches the
           previously decoded one, the cached frame is returned.
         """
+        if self._time_input is not None:
+            self._get_by_index(self._ts_to_index(ts, self._time_input))
         return self._get_by_index(self._ts_to_index(ts, self.time))
 
     def _get_by_index(self, idx: int):
