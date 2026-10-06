@@ -450,60 +450,6 @@ class VideoHandler(BaseAudioVideo):
             pts -= 1
         return pts
 
-    def _extract_keyframe_times_and_points(
-        self, video_path: str | pathlib.Path, stream_index: int = 0, first_only=False
-    ) -> tuple[NDArray, NDArray] | None:
-        """
-        Extract the indices and timestamps of keyframes from a video file.
-
-        This function decodes the video while skipping non-keyframes, and records:
-        - The index of each keyframe in the full video frame sequence
-        - The "Presentation Time Stamp" to each keyframe.
-
-        It is typically intended to run in a background thread during
-        initialization of a ``VideoHandler``, and supports optimized seeking:
-
-        - When the requested frame (based on experimental time) is before the
-          current playback position, seeking backward is necessary.
-
-        - When the requested frame is beyond the next known keyframe, seeking
-          forward to the closest keyframe is more efficient than decoding all
-          intermediate frames.
-
-        Parameters
-        ----------
-        video_path : str or pathlib.Path
-            The path to the video file.
-        stream_index:
-            The index of the video stream.
-        first_only:
-            If true, return the first keyframe only. Used at initialization.
-
-        Returns
-        -------
-        keyframe_points : NDArray[float]
-            The point number of the frame.
-
-        keyframe_timestamps : NDArray[float]
-            The timestamp of the frame.
-        """
-        keyframe_timestamp = []
-        keyframe_pts = []
-
-        with av.open(video_path, **self._av_open_kwargs) as container:
-            stream = container.streams.video[stream_index]
-            stream.codec_context.skip_frame = "NONKEY"
-
-            for frame in container.decode(stream):
-                if not self._running:
-                    return
-                keyframe_timestamp.append(frame.time)
-                keyframe_pts.append(frame.pts)
-                if first_only:
-                    break
-
-        return np.asarray(keyframe_pts), np.asarray(keyframe_timestamp, dtype=float)
-
     def _extract_keyframes_pts(self):
         try:
             with av.open(self.file_path, **self._av_open_kwargs) as container:
@@ -696,66 +642,8 @@ class VideoHandler(BaseAudioVideo):
         with self._lock:
             start, stop = max(self._i - 10, 0), self._i
             avg_step = np.mean(np.diff(self.all_pts[start:stop]))
-        return int(round(self.all_pts[0] + avg_step * idx))
+        return round(self.all_pts[0] + avg_step * idx)
 
-    def _get_key_frame(self, backward) -> av.VideoFrame | NDArray:
-        idx = self.last_loaded_idx
-        if idx is None:
-            # fallback to safe keyframe
-            self._pts_keyframe_ready.wait(2.0)
-            if len(self._keyframe_pts) > 0:
-                idx = self._get_frame_idx(self._keyframe_pts[0]) + 1
-            else:
-                idx = 0  # safe fallback
-
-        # Get the pts of the last loaded index
-        target_pts, _ = self._get_target_frame_pts(idx)
-
-        # Seek the next or previous keyframe based on the direction
-        with self._lock:
-            delta = max(np.mean(np.diff(self._keyframe_pts[:10])) // 2, 1)
-        try:
-            self.container.seek(
-                int(
-                    target_pts + (-delta if backward else delta)
-                ),  # if you're on top of a key frame, seek does not move no matter what
-                backward=backward,
-                any_frame=False,
-                stream=self.stream,
-            )
-        except av.error.PermissionError:
-            # seek backward at the end of the file
-            self.container.seek(
-                int(target_pts),
-                backward=True,
-                any_frame=False,
-                stream=self.stream,
-            )
-        # This seeks and then demuxes by hand, so the shared iterator no longer
-        # describes where the stream is.
-        self._at_eof = False
-        self._decoder = None
-
-        # Decode the next frame, which should be a keyframe
-        frame = next(
-            frame
-            for packet in self.container.demux(self.stream)
-            if packet is not None
-            for frame in packet.decode()
-        )
-
-        self.current_frame = frame
-
-        # Get the index of the key frame
-        self.last_loaded_idx = self._get_frame_idx(frame.pts)
-
-        # Return both
-        return (
-            self.current_frame.to_ndarray(format=self.pixel_format)
-            if self.pixel_format is not None
-            else self.current_frame,
-            self.last_loaded_idx,
-        )
 
     def get(self, ts: float) -> av.VideoFrame | NDArray:
         """
