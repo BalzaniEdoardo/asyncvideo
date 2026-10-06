@@ -206,21 +206,22 @@ class BaseAudioVideo:
 
     def close(self):
         """Close the audio-video stream."""
-        self._running = False
-        threads = ["_index_thread", "_keyframe_thread"]
-        for thread_name in threads:
-            # index thread is only for video frames
-            thread = getattr(self, thread_name, None)
-            if thread is not None and thread.is_alive():
-                thread.join(timeout=1)
-        try:
-            self.container.close()
-        except Exception:
-            logger.exception("Failed to close the audiovideo stream.")
-        finally:
-            # dropping refs to fully close av.InputContainer
-            self.container = None
-            self.stream = None
+        with self._lock:
+            self._running = False
+            threads = ["_index_thread", "_keyframe_thread"]
+            for thread_name in threads:
+                # index thread is only for video frames
+                thread = getattr(self, thread_name, None)
+                if thread is not None and thread.is_alive():
+                    thread.join(timeout=1)
+            try:
+                self.container.close()
+            except Exception:
+                logger.exception("Failed to close the audiovideo stream.")
+            finally:
+                # dropping refs to fully close av.InputContainer
+                self.container = None
+                self.stream = None
 
     # context protocol
     # (with AudioHandler(path) as audiovideo ensure closing)
@@ -521,9 +522,12 @@ class VideoHandler(BaseAudioVideo):
         except Exception:
             logger.exception("Index thread error")
         finally:
-            self._n_frames = self._i
-            self._resolve_time()
-            self._index_ready.set()
+            with self._lock:
+                self._n_frames = self._i
+                self._index_ready.set()
+                if self._running:
+                    self._resolve_time()
+
             
 
     def _resolve_time(self):
