@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import os
 import struct
+import urllib.request
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 
@@ -140,13 +141,24 @@ def children(data: bytes, parent: Box) -> dict[bytes, Box]:
     return found
 
 
-def read_movie_box(path) -> tuple[bytes, Box]:
-    """Load the bytes of the 'moov' box (8.2.1), stepping over the top-level boxes before it.
+def read_movie_box(path) -> tuple[bytes, Box, int]:
+    """Load the bytes of the 'moov' box (8.2.1) of a local file.
 
-    Only box headers are loaded on the way, so a large Media Data Box ('mdat')
-    placed before 'moov' is skipped, not loaded.
+    Steps over the top-level boxes before it. Only box headers are loaded on
+    the way, so a large Media Data Box ('mdat') placed before 'moov' is
+    skipped, not loaded.
+
+    Returns
+    -------
+    data :
+        The payload of the 'moov' box, its header excluded.
+    moov :
+        The 'moov' box, with offsets into ``data``.
+    file_size :
+        Size of the whole file in bytes.
     """
     with open(path, "rb") as f:
+        file_size = os.fstat(f.fileno()).st_size
         while True:
             pos = f.tell()
             header = f.read(8)
@@ -160,15 +172,72 @@ def read_movie_box(path) -> tuple[bytes, Box]:
             if box_type == b"moov":
                 # size == 0 means "to the end of the file" (4.2)
                 payload = f.read() if size == 0 else f.read(size - header_size)
-                # rebuild a buffer holding just this box, so offsets are local to it
-                data = struct.pack(">I4s", 8, b"moov") + payload
-                return data, Box(b"moov", 8, len(data))
+                return payload, Box(b"moov", 0, len(payload)), file_size
             if size == 0:
                 raise ValueError("no 'moov' box in the file")
             if size < header_size:
                 # a seek by a negative amount would loop over the same bytes
                 raise ValueError(f"corrupt {box_type!r} box at byte {pos}")
             f.seek(size - header_size, os.SEEK_CUR)
+
+
+def _http_range(url: str, start: int, stop: int, timeout: float) -> tuple[bytes, int]:
+    """Bytes ``start`` to ``stop - 1`` of ``url``, and the size of the whole file.
+
+    One HTTP Range request. A server that ignores the Range header answers 200
+    with the whole file; the response is then closed unread and
+    `UnsupportedTiming` raised, so the file is never downloaded here.
+    """
+    request = urllib.request.Request(url, headers={"Range": f"bytes={start}-{stop - 1}"})
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        if response.status != 206:
+            raise UnsupportedTiming("the server does not support HTTP Range requests")
+        # Content-Range: bytes <first>-<last>/<total>, total "*" if unknown
+        total = response.headers.get("Content-Range", "").rpartition("/")[2]
+        if not total.isdigit():
+            raise UnsupportedTiming("the server does not give the file size")
+        return response.read(), int(total)
+
+
+def read_movie_box_http(url: str, timeout: float = 30) -> tuple[bytes, Box, int]:
+    """Load the bytes of the 'moov' box (8.2.1) of a file served over HTTP(S).
+
+    Same as `read_movie_box`, with HTTP Range requests in place of seeks: one
+    small request per top-level box header, then one for the 'moov' box. The
+    Media Data Box ('mdat') is never downloaded. Usually 2 to 4 requests: the
+    'moov' box comes right after 'ftyp' in a file written for streaming, and
+    after 'mdat' otherwise.
+
+    Raises
+    ------
+    UnsupportedTiming
+        The server does not support Range requests, or does not give the file
+        size.
+    OSError
+        A network or HTTP error (``urllib.error.URLError`` is an OSError).
+    """
+    pos = 0
+    while True:
+        # 16 bytes: the size and type, and the largesize that may follow them
+        header, file_size = _http_range(url, pos, pos + 16, timeout)
+        if len(header) < 8:
+            raise ValueError("no 'moov' box in the file")
+        size, box_type = struct.unpack_from(BOX_SIZE_AND_TYPE, header)
+        header_size = 8
+        if size == 1:
+            (size,) = struct.unpack_from(UINT64, header, 8)
+            header_size = 16
+        elif size == 0:
+            # size == 0 means "to the end of the file" (4.2)
+            size = file_size - pos
+        if size < header_size:
+            raise ValueError(f"corrupt {box_type!r} box at byte {pos}")
+        if box_type == b"moov":
+            payload, _ = _http_range(url, pos + header_size, pos + size, timeout)
+            return payload, Box(b"moov", 0, len(payload)), file_size
+        pos += size
+        if pos >= file_size:
+            raise ValueError("no 'moov' box in the file")
 
 
 def full_box_version(data: bytes, box: Box) -> tuple[int, int]:
@@ -374,8 +443,11 @@ class VideoTrackTiming:
     is_fragmented: bool = False  # 'mvex' present: more samples live in 'moof' boxes
 
 
-def read_video_track(path, track_id: int) -> VideoTrackTiming:
+def read_video_track(data: bytes, moov: Box, track_id: int) -> VideoTrackTiming:
     """Timing tables of the track whose 'tkhd' track_ID is ``track_id``.
+
+    ``data`` and ``moov`` are the 'moov' box as `read_movie_box` or
+    `read_movie_box_http` return it; where they came from does not matter here.
 
     The boxes used, and where the spec places them:
 
@@ -397,7 +469,6 @@ def read_video_track(path, track_id: int) -> VideoTrackTiming:
 
     The boxes are looked up at exactly these places.
     """
-    data, moov = read_movie_box(path)
     movie_children = children(data, moov)
     movie_timescale = parse_timescale(data, movie_children[b"mvhd"])
     is_fragmented = b"mvex" in movie_children
@@ -528,13 +599,13 @@ class MoovIndex:
     timescale: int
 
 
-def read_moov_index(path, track_id: int) -> MoovIndex:
+def read_moov_index(path: str, track_id: int) -> MoovIndex:
     """Frame and keyframe PTS of an mp4/mov track, without demuxing.
 
     Parameters
     ----------
     path :
-        A local mp4/mov file.
+        A local mp4/mov file, or an HTTP(S) URL of one.
     track_id :
         The track's 'tkhd' track_ID; PyAV's ``stream.id`` for mp4/mov.
 
@@ -542,11 +613,27 @@ def read_moov_index(path, track_id: int) -> MoovIndex:
     ------
     UnsupportedTiming
         The timestamps are not fully given by 'moov' (fragmented file,
-        inconsistent tables, ...); demux instead.
+        inconsistent tables, ...), the source is neither a local file nor an
+        HTTP(S) URL, or the server does not support Range requests; demux
+        instead.
     UnsupportedEditListError
         The edit list is not one handled here (see that class).
+    OSError
+        The file could not be opened, or a network or HTTP error.
     """
-    track = read_video_track(path, track_id)
+    # ffmpeg wrapper protocols that pass the inner URL's bytes through
+    # unchanged: "async:" fetches ahead in a background thread, "cache:" keeps a
+    # local copy. The header is fetched from the inner URL. Wrappers that change
+    # the bytes (e.g. "crypto:") are not removed, so they fall back to demuxing.
+    while path.startswith(("async:", "cache:")):
+        path = path.partition(":")[2]
+    if path.startswith(("http://", "https://")):
+        data, moov, file_size = read_movie_box_http(path)
+    elif os.path.isfile(path):
+        data, moov, file_size = read_movie_box(path)
+    else:
+        raise UnsupportedTiming("not a local file or an HTTP(S) URL")
+    track = read_video_track(data, moov, track_id)
     if track.is_fragmented:
         # 8.8.1: the samples in 'moov' are only the first part of the track.
         raise UnsupportedTiming("fragmented: more samples live in 'moof' boxes")
@@ -579,7 +666,7 @@ def read_moov_index(path, track_id: int) -> MoovIndex:
     # 8.6.1.1: non-output samples are never presented.
     decoded = composition_offsets != NON_OUTPUT_SAMPLE_OFFSET
     # A truncated file: the table lists samples whose bytes are not in the file.
-    decoded &= sample_end_offsets(track) <= os.path.getsize(path)
+    decoded &= sample_end_offsets(track) <= file_size
     # Decoding can start at a sync sample (3.1.12, 8.6.2); without an 'stss' box
     # every sample is one. Samples before the first sync sample lack their
     # reference frames. Not spec: the spec only guarantees decoding from a sync

@@ -9,6 +9,7 @@ from __future__ import annotations
 import abc
 import logging
 import math
+import os
 import pathlib
 import struct
 import threading
@@ -146,8 +147,13 @@ class BaseAudioVideo:
         if av_open_kwargs is None:
             av_open_kwargs = {}
         self._av_open_kwargs = av_open_kwargs
-        self.file_path = pathlib.Path(path)
-        self.container = av.open(path, **av_open_kwargs)
+        # Kept as the string the caller gave, not a pathlib.Path: Path collapses
+        # the "//" of a URL ("https://host/v.mp4" becomes "https:/host/v.mp4"),
+        # and every later av.open (the index threads) must get the same source.
+        self.file_path: str = os.fspath(path)
+        # last component of the path or URL, for messages
+        self._file_name = os.path.basename(self.file_path)
+        self.container = av.open(self.file_path, **av_open_kwargs)
         self._running = True
 
         # initialize index for last decoded frame
@@ -429,8 +435,10 @@ class VideoHandler(BaseAudioVideo):
     def _read_moov_index(self) -> MoovIndex | None:
         """Frame and keyframe PTS from the 'moov' box, or None to index by demuxing.
 
-        Only for local mp4/mov files. Returns None when the 'moov' box does not
-        fully give the timing (fragmented file, inconsistent tables, ...), so the
+        For mp4/mov files, local or served over HTTP(S). Returns None when the
+        'moov' box does not fully give the timing (fragmented file, inconsistent
+        tables, ...), when the source is neither of those, or when the header
+        cannot be fetched (network error, server without Range requests), so the
         index threads take over as for any other format.
 
         Raises
@@ -442,8 +450,6 @@ class VideoHandler(BaseAudioVideo):
         """
         if "mp4" not in self.container.format.name.split(","):
             return None
-        if not self.file_path.is_file():
-            return None
         # ffmpeg options that change how the edit list is applied, so the PTS
         # PyAV returns no longer follow the 'moov' box
         options = self._av_open_kwargs.get("options") or {}
@@ -454,19 +460,19 @@ class VideoHandler(BaseAudioVideo):
             index = read_moov_index(self.file_path, self.stream.id)
         except UnsupportedEditListError as exc:
             raise UnsupportedEditListError(
-                f"{self.file_path.name}: {exc}. The file's edit list plays parts of "
+                f"{self._file_name}: {exc}. The file's edit list plays parts of "
                 "the recorded video out of order, skipped, repeated or held; this "
                 "usually comes from cutting a file in an editor without "
                 "re-encoding. asyncvideo cannot yet match those frames to "
                 "timestamps. Either re-encode the file, e.g.\n"
-                f"    ffmpeg -i {self.file_path.name} -c:v libx264 out.mp4\n"
+                f"    ffmpeg -i {self._file_name} -c:v libx264 out.mp4\n"
                 "or ignore the edit list and get every stored frame in recording "
                 "order:\n"
                 '    VideoHandler(path, av_open_kwargs={"options": '
                 '{"ignore_editlist": "1"}})'
             ) from exc
-        except (UnsupportedTiming, ValueError, KeyError, struct.error) as exc:
-            logger.debug("%s: indexing by demux: %s", self.file_path.name, exc)
+        except (UnsupportedTiming, OSError, ValueError, KeyError, struct.error) as exc:
+            logger.debug("%s: indexing by demux: %s", self._file_name, exc)
             return None
         # the 'moov' PTS are in the media timescale; PyAV's must be in the same unit
         if self.stream.time_base != Fraction(1, index.timescale):
@@ -503,7 +509,7 @@ class VideoHandler(BaseAudioVideo):
         logger.warning(
             "%s: frame timestamps differ from the container index; estimating "
             "unindexed frames from the frame rate instead",
-            self.file_path.name,
+            self._file_name,
         )
         return False
 
@@ -1066,7 +1072,7 @@ class VideoHandler(BaseAudioVideo):
             "returning the nearest frame decoded",
             target_pts,
             idx,
-            self.file_path.name,
+            self._file_name,
             len(rewind_points),
         )
         return frame

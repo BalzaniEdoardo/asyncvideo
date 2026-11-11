@@ -762,6 +762,8 @@ def test_get_slice_past_index_estimates_without_waiting(video_info):
 def test_pts_predicted_from_container_index(video_info):
     """Where the container lists every frame's DTS, PTS are predicted exactly at init."""
     _, frame_pts_ref, _, video_path = video_info
+    if video_path.suffix == ".mp4":
+        pytest.skip("mp4 is indexed from its 'moov' box, not predicted from DTS")
     with VideoHandler(video_path) as video:
         if not video._pts_from_dts:
             # mkv, webm and mpg do not list every frame in their header
