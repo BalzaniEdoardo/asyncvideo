@@ -621,15 +621,14 @@ def read_moov_index(path: str, track_id: int) -> MoovIndex:
     OSError
         The file could not be opened, or a network or HTTP error.
     """
-    # ffmpeg wrapper protocols that pass the inner URL's bytes through
-    # unchanged: "async:" fetches ahead in a background thread, "cache:" keeps a
-    # local copy. The header is fetched from the inner URL. Wrappers that change
-    # the bytes (e.g. "crypto:") are not removed, so they fall back to demuxing.
-    while path.startswith(("async:", "cache:")):
-        path = path.partition(":")[2]
-    # ffmpeg's local file protocol: "file:/data/v.mp4" is the path "/data/v.mp4"
-    if path.startswith("file:"):
-        path = path.removeprefix("file:")
+    # ffmpeg protocol prefixes that leave the bytes unchanged, so the header is
+    # fetched from what follows them: "async:" fetches ahead in a background
+    # thread, "cache:" keeps a local copy, "file:" is a local path. In this
+    # order they cover e.g. "async:cache:https://..." and "async:file:/...".
+    # Prefixes that change the bytes (e.g. "crypto:") stay, and the source then
+    # falls back to demuxing.
+    for prefix in ("async:", "cache:", "file:"):
+        path = path.removeprefix(prefix)
     if path.startswith(("http://", "https://")):
         data, moov, file_size = read_movie_box_http(path)
     elif os.path.isfile(path):
