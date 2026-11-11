@@ -627,6 +627,9 @@ def read_moov_index(path: str, track_id: int) -> MoovIndex:
     # the bytes (e.g. "crypto:") are not removed, so they fall back to demuxing.
     while path.startswith(("async:", "cache:")):
         path = path.partition(":")[2]
+    # ffmpeg's local file protocol: "file:/data/v.mp4" is the path "/data/v.mp4"
+    if path.startswith("file:"):
+        path = path.removeprefix("file:")
     if path.startswith(("http://", "https://")):
         data, moov, file_size = read_movie_box_http(path)
     elif os.path.isfile(path):
