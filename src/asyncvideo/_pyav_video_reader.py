@@ -10,17 +10,25 @@ import abc
 import logging
 import math
 import pathlib
+import struct
 import threading
 import time
 import warnings
 from collections import deque
 from concurrent.futures import Future
+from fractions import Fraction
 from typing import Literal
 
 import av
 import numpy as np
 from numpy.typing import NDArray
 
+from ._moov_index import (
+    MoovIndex,
+    UnsupportedEditListError,
+    UnsupportedTiming,
+    read_moov_index,
+)
 from .convert import to_rgb
 
 logger = logging.getLogger(__name__)
@@ -157,10 +165,9 @@ class BaseAudioVideo:
 
         self._keyframe_pts = []
         self._pts_keyframe_ready = threading.Event()
-        self._keyframe_thread = threading.Thread(
-            target=self._extract_keyframes_pts, daemon=True
-        )
-        self._keyframe_thread.start()
+        # Started by the subclass only when the keyframes must be found by
+        # demuxing; a file whose header lists them needs no thread.
+        self._keyframe_thread: threading.Thread | None = None
 
     @abc.abstractmethod
     def _ts_to_pts(self, ts: float) -> int:
@@ -311,14 +318,39 @@ class VideoHandler(BaseAudioVideo):
         self.stream_index = stream_index
         self.pixel_format = pixel_format
 
-        # mp4, mov and avi list the DTS of every frame in their header. Where that
-        # list is complete, frame PTS are predicted from it right away instead of
-        # waiting for the index thread, whose demux downloads the whole file when
-        # streaming. mkv, webm, mpg and fragmented mp4 list few or no frames.
+        # mp4 and mov list every frame's timestamps in their 'moov' box, so the
+        # whole index is known here, without demuxing. Other files, and mp4/mov
+        # files whose 'moov' box does not fully give the timing, are indexed by
+        # the demux threads.
+        try:
+            moov_index = self._read_moov_index()
+        except Exception:
+            self.close()
+            raise
+        if moov_index is not None:
+            # an array here, a list the keyframe thread appends to otherwise;
+            # every reader of it accepts both
+            self._keyframe_pts = moov_index.keyframe_pts
+            self._pts_keyframe_ready.set()
+        else:
+            self._keyframe_thread = threading.Thread(
+                target=self._extract_keyframes_pts, daemon=True
+            )
+            self._keyframe_thread.start()
+
+        # avi lists the DTS of every frame in its header (so do mp4 and mov, but
+        # those are indexed from 'moov' above). Where that list is complete, frame
+        # PTS are predicted from it right away instead of waiting for the index
+        # thread, whose demux downloads the whole file when streaming. mkv, webm,
+        # mpg and fragmented mp4 list few or no frames.
         # Copied now: index_entries are live views and change while demuxing.
         entries = self.stream.index_entries
         entry_dts, entry_key_dts = None, None
-        if self.stream.frames > 0 and len(entries) == self.stream.frames:
+        if (
+            moov_index is None
+            and self.stream.frames > 0
+            and len(entries) == self.stream.frames
+        ):
             pairs = [(e.timestamp, e.is_keyframe) for e in entries]
             entry_dts = np.sort(np.array([t for t, _ in pairs], dtype=np.int64))
             entry_key_dts = np.sort(np.array([t for t, k in pairs if k], dtype=np.int64))
@@ -339,12 +371,19 @@ class VideoHandler(BaseAudioVideo):
         # declare nothing (vp9/webm report 0) are still checked by
         # ``_resolve_time`` once the indexer has counted the frames, which stays
         # the authoritative check: a header count can disagree with reality.
-        if self._time_provided and self.stream.frames > 0:
+        # The 'moov' index counts the frames the decoder outputs, so for mp4/mov
+        # it replaces the declared count, which also counts frames that are
+        # never shown (outside the edit list, or missing from a truncated file).
+        declared_frames = (
+            len(moov_index.pts) if moov_index is not None else self.stream.frames
+        )
+        if self._time_provided and declared_frames > 0:
             n_times = len(self._time_input)
-            if n_times != self.stream.frames:
+            if n_times != declared_frames:
+                self.close()
                 raise ValueError(
                     f"the provided time array has length {n_times}, but the video has "
-                    f"{self.stream.frames} frames; pass one timestamp per frame"
+                    f"{declared_frames} frames; pass one timestamp per frame"
                 )
 
         # initialize index for last decoded frame
@@ -370,14 +409,69 @@ class VideoHandler(BaseAudioVideo):
         self._n_frames: int | None = (
             self.stream.frames if self.stream.frames > 0 else None
         )
-        self._index_thread = threading.Thread(target=self._build_index, daemon=True)
 
         self._index_ready = threading.Event()
-        self._index_thread.start()
+        self._index_thread: threading.Thread | None = None
+        if moov_index is not None:
+            # the whole index is already known: no thread, everything is ready
+            self.all_pts = moov_index.pts
+            self._i = self._n_frames = len(self.all_pts)
+            self._resolve_time()
+            self._index_ready.set()
+        else:
+            self._index_thread = threading.Thread(target=self._build_index, daemon=True)
+            self._index_thread.start()
         if entry_dts is not None:
             self._predict_pts_from_dts(entry_dts, entry_key_dts)
         # decode first frame (already cached if the prediction decoded it)
         self.__getitem__(0)
+
+    def _read_moov_index(self) -> MoovIndex | None:
+        """Frame and keyframe PTS from the 'moov' box, or None to index by demuxing.
+
+        Only for local mp4/mov files. Returns None when the 'moov' box does not
+        fully give the timing (fragmented file, inconsistent tables, ...), so the
+        index threads take over as for any other format.
+
+        Raises
+        ------
+        UnsupportedEditListError
+            The file's edit list is one whose frame timestamps are not handled.
+            Raised rather than falling back: the demux path would index these
+            frames wrongly too.
+        """
+        if "mp4" not in self.container.format.name.split(","):
+            return None
+        if not self.file_path.is_file():
+            return None
+        # ffmpeg options that change how the edit list is applied, so the PTS
+        # PyAV returns no longer follow the 'moov' box
+        options = self._av_open_kwargs.get("options") or {}
+        if "ignore_editlist" in options or "advanced_editlist" in options:
+            return None
+        try:
+            # PyAV's stream.id is the track_ID of the mp4/mov track
+            index = read_moov_index(self.file_path, self.stream.id)
+        except UnsupportedEditListError as exc:
+            raise UnsupportedEditListError(
+                f"{self.file_path.name}: {exc}. The file's edit list plays parts of "
+                "the recorded video out of order, skipped, repeated or held; this "
+                "usually comes from cutting a file in an editor without "
+                "re-encoding. asyncvideo cannot yet match those frames to "
+                "timestamps. Either re-encode the file, e.g.\n"
+                f"    ffmpeg -i {self.file_path.name} -c:v libx264 out.mp4\n"
+                "or ignore the edit list and get every stored frame in recording "
+                "order:\n"
+                '    VideoHandler(path, av_open_kwargs={"options": '
+                '{"ignore_editlist": "1"}})'
+            ) from exc
+        except (UnsupportedTiming, ValueError, KeyError, struct.error) as exc:
+            logger.debug("%s: indexing by demux: %s", self.file_path.name, exc)
+            return None
+        # the 'moov' PTS are in the media timescale; PyAV's must be in the same unit
+        if self.stream.time_base != Fraction(1, index.timescale):
+            return None
+        return index
 
     def _predict_pts_from_dts(self, entry_dts: NDArray, entry_key_dts: NDArray) -> None:
         """Predict every frame's PTS from the container's DTS list.
