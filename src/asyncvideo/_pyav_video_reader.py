@@ -607,7 +607,7 @@ class VideoHandler(BaseAudioVideo):
     def _extract_keyframes_pts(self):
         try:
             with av.open(self.file_path, **self._av_open_kwargs) as container:
-                stream = container.streams.video[0]
+                stream = container.streams.video[self.stream_index]
                 for packet in container.demux(stream):
                     if not self._running:
                         return
