@@ -1361,15 +1361,23 @@ class VideoHandler(BaseAudioVideo):
         if self.current_frame is None:
             self.get(0)
 
-        preceding_frame = self.current_frame
+        # None until this call decodes a frame: current_frame may come from the
+        # buffer and so differ from the decoder's position. A target passed with
+        # nothing before it then goes through the late-seek recovery below.
+        preceding_frame = None
         last_frame = self.current_frame
         # identity of the frame most recently added to the output, so the end of
         # the stream can tell whether the last decoded frame was already used
         last_appended = None
-        # The first target is seeked to unconditionally, as before; from then on
-        # the shared iterator carries the position (and any queued frames)
-        # forward, including past the end of this call.
+        # The first target is seeked to only when the decoder cannot carry on to
+        # it: nothing decoded yet, decoder at EOF, or _need_seek_call says so. A
+        # slice that starts right after the previous one (playback) then decodes on
+        # from where the previous call stopped; over a network stream each seek
+        # is a new HTTP request. From then on the shared iterator carries the
+        # position (and any queued frames) forward, including past the end of
+        # this call.
         seeked_for = None
+        must_seek = self._at_eof or self._stream_pts is None
 
         while collected < num_frames:
             # check buffer first
@@ -1386,7 +1394,7 @@ class VideoHandler(BaseAudioVideo):
 
             # Seek when the target is behind us or past a nearer keyframe.
             # At most once per target: repeating the same seek lands in the same place.
-            if seeked_for is None or (
+            if (seeked_for is None and must_seek) or (
                 seeked_for != indices[collected]
                 and self._need_seek_call(self._stream_pts, target_pts)
             ):
