@@ -701,24 +701,35 @@ def read_moov_index(path: str, track_id: int) -> MoovIndex:
             f"edit list with {len(edits)} edits that map media; only a single "
             "edit (optionally after an empty one) is supported"
         )
-    shown = decoded.copy()
+    # The samples inside the edit, by composition time alone: what ffmpeg's
+    # demuxer keeps, before the decoder drops anything (pre-sync samples) and
+    # whatever the file is missing (truncation).
+    in_edit = composition_offsets != NON_OUTPUT_SAMPLE_OFFSET
     media_start = 0
     if edits:
         edit = edits[0]
         if edit.media_rate != 1:
             # 8.6.6.3: rate 0 is a 'dwell', one frame held for the whole segment.
             raise UnsupportedEditListError(f"edit with media_rate {edit.media_rate}")
-        media_start = edit.media_time
         # Samples composed before media_time or after the segment are not shown.
         # Not spec: edits need not fall on sample times (8.6.6.1 NOTE), so by
         # the spec a frame starting before media_time but lasting into the edit
         # is partly shown; ffmpeg drops it, and so do we.
-        shown &= composition_times >= media_start
+        in_edit &= composition_times >= edit.media_time
         # A segment_duration of 0 maps the media from media_time on with no end
         # (8.6.6.1, said of fragmented files, whose length 'moov' cannot know).
         if edit.segment_duration:
-            segment_end = media_start + movie_to_media_time(edit.segment_duration, track)
-            shown &= composition_times < segment_end
+            segment_end = edit.media_time + movie_to_media_time(
+                edit.segment_duration, track
+            )
+            in_edit &= composition_times < segment_end
+        # By the spec media_time maps to the start of the presentation (8.6.6.3).
+        # Not spec: ffmpeg maps the earliest composition time inside the edit
+        # there instead (its min_corrected_pts). The two differ only when the
+        # edit starts between samples, e.g. a file whose opening keyframe was cut.
+        if in_edit.any():
+            media_start = composition_times[in_edit].min()
+    shown = decoded & in_edit
 
     presentation_times = composition_times - media_start + presentation_start
     # samples are listed in decoding order; sorting gives presentation order
