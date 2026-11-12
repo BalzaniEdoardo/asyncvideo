@@ -902,8 +902,29 @@ class VideoHandler(BaseAudioVideo):
     def _frames(self):
         """The live frame iterator, opened on first use after a seek."""
         if self._decoder is None:
-            self._decoder = self.container.decode(self.stream)
+            self._decoder = self._decode_packets()
         return self._decoder
+
+    def _decode_packets(self):
+        """Frames of the stream, like ``container.decode``, skipping corrupt packets.
+
+        ``container.decode`` ends at the first packet the decoder rejects, so a
+        single damaged packet (e.g. the last one of a partial download) would
+        make every frame after it unreachable. ffmpeg's players drop such a
+        packet and go on; so does this. The frames that depended on it come out
+        damaged or not at all, as ffmpeg decides.
+        """
+        for packet in self.container.demux(self.stream):
+            try:
+                frames = packet.decode()
+            except av.error.InvalidDataError:
+                logger.warning(
+                    "%s: skipping a packet the decoder rejected (dts %s)",
+                    self._file_name,
+                    packet.dts,
+                )
+                continue
+            yield from frames
 
     def _decode_and_check_frames(self, target_pts: int, idx: int) -> av.VideoFrame | None:
         """Decode from stream, recovering once if the decoder is already at EOF."""
