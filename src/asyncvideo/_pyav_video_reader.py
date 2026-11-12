@@ -708,7 +708,7 @@ class VideoHandler(BaseAudioVideo):
                 # Linear extrapolation from available pts (use last 10 steps for an estimate)
                 start, stop = max(self._i - 10, 0), self._i
                 avg_step = np.mean(np.diff(self.all_pts[start:stop]))
-                idx = int(round((pts - self.all_pts[0]) / avg_step))
+                idx = round((pts - self.all_pts[0]) / avg_step)
         return idx
 
     def _get_target_frame_pts(self, idx: int) -> int:

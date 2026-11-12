@@ -7,11 +7,11 @@ import queue as _stdlib_queue
 import sys
 import threading
 import time as _time
-from typing import Any, Literal
 import weakref
 from concurrent.futures import Future
 from multiprocessing import Queue
 from pathlib import Path
+from typing import Any, Literal
 
 import numpy as np
 from numpy.typing import NDArray
@@ -201,7 +201,7 @@ class AsyncVideoReader:
         yuv_packed: bool = False,
         stream_index: int = 0,
         buffer_size: int = 30,
-        av_open_kwargs: dict[str, Any] = None,
+        av_open_kwargs: dict[str, Any] | None = None,
         mp_context: None | Literal["fork", "spawn", "forkserver"] = None,
     ) -> None:
         self._path = path

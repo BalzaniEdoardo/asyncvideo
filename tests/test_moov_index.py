@@ -121,7 +121,7 @@ def test_ignore_editlist_option_reads_unsupported_edit_list(edge_case_paths, nam
 def test_stream_index_picks_its_own_track(edge_case_paths):
     """Tracks are matched by track_ID, not position: stream 1 gets the second track."""
     path = edge_case_paths["two_video_tracks"]
-    pts, frames, _ = decode_all(path, stream_index=1)
+    pts, _, _ = decode_all(path, stream_index=1)
     with VideoHandler(path, stream_index=1) as video:
         assert video._index_thread is None
         # the generator makes stream k (k + 1) times the base size: 320x240 here
@@ -156,7 +156,7 @@ def test_other_sources_are_unsupported(source):
 class _RangeHandler(http.server.SimpleHTTPRequestHandler):
     """Serves files with HTTP Range support, which http.server lacks."""
 
-    def do_GET(self):  # noqa: N802 -- http.server's naming
+    def do_GET(self):  # http.server dispatches GET requests to this name
         path = self.translate_path(self.path)
         with open(path, "rb") as f:
             data = f.read()
