@@ -164,6 +164,29 @@ The three cameras run at 60, 30 and 150 fps, so `t = 124.5 s` is frame **271**, 
 
 [`examples/ibl_multiview.py`](examples/ibl_multiview.py) is a runnable version of this against a public [International Brain Laboratory](https://www.internationalbrainlab.com) session that records three cameras at 60, 30 and 150 fps. It needs the docs extra (`pip install -e ".[docs]"`) and downloads a few megabytes of example clips on first run.
 
+### Streaming: a video you have not downloaded
+
+Pass a URL instead of a path. Only the frames you read are downloaded:
+
+```python
+from asyncvideo import VideoHandler
+
+# the full IBL body camera: 2.25 GB, two hours at 30 fps
+url = (
+    "https://ibl.flatironinstitute.org/public/churchlandlab_ucla/Subjects/MFD_09/"
+    "2023-10-19/001/raw_video_data/"
+    "_iblrig_bodyCamera.raw.e001a1f0-fbf8-49e3-8ecd-6f4c03c26b56.mp4"
+)
+
+with VideoHandler("async:" + url, pixel_format="rgb24") as video:
+    print(video.shape)                              # (215669, 512, 640, 3)
+    clip = video[video.get_slice(3600.0, 3602.0)]   # two seconds, an hour in
+```
+
+For mp4 and mov, the frame index comes from the file's header, fetched with a few HTTP range requests, so every frame is indexed as soon as the video opens. Other containers (mkv, webm, fragmented mp4) are indexed by reading the stream, which downloads it. The `async:` prefix is FFmpeg's read-ahead: optional, but it makes reading consecutive frames much faster.
+
+[`examples/streaming_video.py`](examples/streaming_video.py) runs this and plots the frames.
+
 ## Example data
 
 Every snippet above runs against short clips of a real recording, downloaded on first use by `asyncvideo.fetch` and cached locally. They are three cameras filming one mouse at 60, 30 and 150 fps, ten seconds each, about 10 MB in total. Reading your own videos needs none of this — `pooch` and `tqdm` come with the docs extra and are only used to fetch the examples.
