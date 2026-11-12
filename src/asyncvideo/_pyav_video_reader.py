@@ -227,6 +227,14 @@ class BaseAudioVideo:
                 thread = getattr(self, thread_name, None)
                 if thread is not None and thread.is_alive():
                     thread.join(timeout=1)
+            # The frame iterator holds the last packet, and through it the
+            # decoder, whose threads would outlive container.close(). A process
+            # forked afterwards (AsyncVideoReader's worker) then hangs on a lock
+            # one of those threads held. Release the decoder first.
+            decoder = getattr(self, "_decoder", None)
+            if decoder is not None:
+                decoder.close()
+                self._decoder = None
             try:
                 self.container.close()
             except Exception:
