@@ -7,6 +7,7 @@ import queue as _stdlib_queue
 import sys
 import threading
 import time as _time
+from typing import Any, Literal
 import weakref
 from concurrent.futures import Future
 from multiprocessing import Queue
@@ -162,6 +163,12 @@ class AsyncVideoReader:
     buffer_size :
         Number of recently decoded frames the worker keeps cached. A request that
         hits the cache needs no seeking or decoding. Default is 30.
+    av_open_kwargs :
+        Additional keyword arguments to pass to ``av.open()``.
+    mp_context :
+        Either None or a string "spawn", "fork" or, "forkserver" that specifies the
+        multiprocessing context. If None, the default is "spawn" for windows, "fork"
+        otherwise.
 
     Notes
     -----
@@ -194,8 +201,12 @@ class AsyncVideoReader:
         yuv_packed: bool = False,
         stream_index: int = 0,
         buffer_size: int = 30,
+        av_open_kwargs: dict[str, Any] = None,
+        mp_context: None | Literal["fork", "spawn", "forkserver"] = None,
     ) -> None:
-        self._path = Path(path)
+        self._path = path
+        if av_open_kwargs is None:
+            av_open_kwargs = {}
 
         # pixel_format is deliberately fixed: frames cross the process boundary in
         # the stream's native layout, since the shared-memory segments are sized
@@ -205,6 +216,7 @@ class AsyncVideoReader:
             "stream_index": stream_index,
             "time": time,
             "buffer_size": buffer_size,
+            "av_open_kwargs": av_open_kwargs,
         }
 
         vr = VideoHandler(self._path, pixel_format=None, **self._handler_kwargs)
@@ -253,22 +265,27 @@ class AsyncVideoReader:
         vr.close()
         del vr
 
-        self._request_queue: Queue = mp_ctx.Queue()
-        self._response_queue: Queue = mp_ctx.Queue()
+        if mp_context is None:
+            mp_context = mp_ctx
+        else:
+            mp_context = multiprocessing.get_context(mp_context)
+
+        self._request_queue: Queue = mp_context.Queue()
+        self._response_queue: Queue = mp_context.Queue()
         # carries exactly one message: the frame times, or the error raised while
         # resolving them. Kept off the request queue, which is drained of stale
         # entries on every new request and would discard it.
-        self._time_queue: Queue = mp_ctx.Queue()
+        self._time_queue: Queue = mp_context.Queue()
 
-        self._stop_event = mp_ctx.Event()
-        self._buffer_lock = mp_ctx.Lock()
+        self._stop_event = mp_context.Event()
+        self._buffer_lock = mp_context.Lock()
 
         self._pending_rid: int = 0
         # shared with the worker process. The worker uses this to skip any
         # request whose rid has already been superseded by a newer one,
         # without false-dropping the current request (a single ``cancel_event``
         # bit can't distinguish *which* request was cancelled).
-        self._latest_rid = mp_ctx.Value("q", 0)
+        self._latest_rid = mp_context.Value("q", 0)
         self._pending_future: FutureArray | None = None
         # what the request in flight asked for, so that a request for the same frame can share
         # its decode instead of superseding it
@@ -291,7 +308,7 @@ class AsyncVideoReader:
             yuv_packed=self._yuv_packed,
         )
 
-        self._worker = mp_ctx.Process(
+        self._worker = mp_context.Process(
             target=_reader_process,
             kwargs={
                 "path": self._path,
