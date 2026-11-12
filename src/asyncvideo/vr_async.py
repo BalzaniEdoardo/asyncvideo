@@ -4,6 +4,7 @@ import atexit
 import logging
 import multiprocessing
 import queue as _stdlib_queue
+import sys
 import threading
 import time as _time
 import weakref
@@ -30,9 +31,13 @@ from .utils import (
     create_shared_memory,
 )
 
-# spawn, not fork: since PyAV 17 frame conversion uses a swscale thread pool,
-# and a forked worker inherits its locks without its threads, so it hangs.
-mp_ctx = multiprocessing.get_context("spawn")
+# fork clones the parent process directly — no re-import of the main script,
+# so AsyncVideoReader can be instantiated at module level (e.g. in scripts or
+# IPython) without hitting the spawn bootstrap trap. Windows only has spawn.
+if sys.platform == "win32":
+    mp_ctx = multiprocessing.get_context("spawn")
+else:
+    mp_ctx = multiprocessing.get_context("fork")
 
 logger = logging.getLogger(__name__)
 
@@ -40,7 +45,7 @@ logger = logging.getLogger(__name__)
 # ----------------------------------------------------------------------
 # Bounded, non-blocking teardown
 # ----------------------------------------------------------------------
-# Under the "spawn" start method (the default) a freshly created worker is still
+# Under the "spawn" start method (Windows) a freshly created worker is still
 # importing its dependencies and cannot observe the stop event for a second or
 # more (pynaviz#120). ``shutdown`` therefore hands the join and the release of
 # the shared memory to a helper thread by default, so closing a reader never
@@ -161,11 +166,9 @@ class AsyncVideoReader:
     av_open_kwargs :
         Additional keyword arguments to pass to ``av.open()``.
     mp_context :
-        Either None or a string "spawn", "fork" or "forkserver" that specifies the
-        multiprocessing context. If None, "spawn", on every platform: with PyAV 17
-        or newer, a "fork" worker can hang if the parent has converted a frame.
-        Under "spawn", a script must create readers inside
-        ``if __name__ == "__main__":``.
+        Either None or a string "spawn", "fork" or, "forkserver" that specifies the
+        multiprocessing context. If None, the default is "spawn" for windows, "fork"
+        otherwise.
 
     Notes
     -----
@@ -611,7 +614,7 @@ class AsyncVideoReader:
         ----------
         wait :
             Block until the worker has exited and the memory is released. Under
-            the "spawn" start method (the default) a worker created moments earlier
+            the "spawn" start method (Windows) a worker created moments earlier
             is still importing and cannot react to the stop request, so this can
             take a second or more.
 
