@@ -50,6 +50,12 @@ def video_gen(session):
         session.log("Generating numbered videos...")
         session.run("python", str(tests_path / "generate_numbered_video.py"))
 
+    # mp4/mov timing edge cases for the 'moov' index (test_moov_index.py).
+    # Twelve tiny clips, a few seconds in all, so always regenerated: the files
+    # then always match the generator.
+    session.log("Generating edge case videos...")
+    session.run("python", str(tests_path / "generate_edge_case_videos.py"))
+
 
 @nox.session(name="tests", reuse_venv=True)
 def tests(session):
